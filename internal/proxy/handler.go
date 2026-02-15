@@ -11,49 +11,103 @@ import (
 
 	"github.com/abhishekjha17/intern/internal/models"
 	"github.com/abhishekjha17/intern/internal/router"
+	"github.com/abhishekjha17/intern/internal/translator"
 )
 
 type ProxyHandler struct {
 	localTarget *url.URL
 	cloudTarget *url.URL
+	router      *router.Router
+	localModel  string
+	httpClient  *http.Client
 }
 
-func NewProxyHandler(ollamaUrl, cloudUrl string) *ProxyHandler {
-	local, _ := url.Parse(ollamaUrl) // Default Ollama port
+func NewProxyHandler(ollamaUrl, cloudUrl, localModel string, r *router.Router) *ProxyHandler {
+	local, _ := url.Parse(ollamaUrl)
 	cloud, _ := url.Parse(cloudUrl)
-	return &ProxyHandler{localTarget: local, cloudTarget: cloud}
+	return &ProxyHandler{
+		localTarget: local,
+		cloudTarget: cloud,
+		router:      r,
+		localModel:  localModel,
+		httpClient:  &http.Client{},
+	}
 }
 
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 1. Read body to peek
 	body, _ := io.ReadAll(r.Body)
 	var anthroReq models.AnthropicRequest
 	json.Unmarshal(body, &anthroReq)
-	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
-	log.Printf("recv inference request :%s", anthroReq)
+	log.Printf("recv inference request: model=%s stream=%v", anthroReq.Model, anthroReq.Stream)
 
-	// 2. Get decision from Bouncer
-	decision := router.Decide(anthroReq)
+	decision := h.router.Decide(anthroReq)
+	log.Printf("routing decision: %s", decision)
 
-	log.Printf("routing decision : %s", decision)
-
-	// 3. Setup Reverse Proxy
-	var target *url.URL
 	if decision == router.RouteLocal {
-		target = h.localTarget
-		// Note: Here you would call internal/translator to fix headers/paths
+		h.handleLocal(w, anthroReq)
 	} else {
-		target = h.cloudTarget
+		// Restore body for cloud passthrough
+		r.Body = io.NopCloser(bytes.NewBuffer(body))
+		h.handleCloud(w, r)
+	}
+}
+
+func (h *ProxyHandler) handleLocal(w http.ResponseWriter, anthroReq models.AnthropicRequest) {
+	// Translate Anthropic request to Ollama format
+	ollamaReq := translator.AnthropicToOllama(anthroReq, h.localModel)
+	reqBody, err := json.Marshal(ollamaReq)
+	if err != nil {
+		http.Error(w, "translation error", http.StatusInternalServerError)
+		return
 	}
 
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	// POST to Ollama's OpenAI-compatible endpoint
+	ollamaURL := h.localTarget.String() + "/v1/chat/completions"
+	httpReq, err := http.NewRequest("POST", ollamaURL, bytes.NewReader(reqBody))
+	if err != nil {
+		http.Error(w, "request creation error", http.StatusInternalServerError)
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
 
-	// Update the request for the target
+	resp, err := h.httpClient.Do(httpReq)
+	if err != nil {
+		log.Printf("ollama unreachable for inference: %v", err)
+		http.Error(w, "local model unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if anthroReq.Stream {
+		// Streaming: translate Ollama SSE to Anthropic SSE in real-time
+		translator.StreamOllamaToAnthropic(w, resp.Body, h.localModel)
+	} else {
+		// Non-streaming: read full response, translate, write back
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "read error", http.StatusBadGateway)
+			return
+		}
+
+		var ollamaResp models.OllamaResponse
+		if err := json.Unmarshal(respBody, &ollamaResp); err != nil {
+			http.Error(w, "response parse error", http.StatusBadGateway)
+			return
+		}
+
+		anthropicResp := translator.OllamaToAnthropic(ollamaResp)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(anthropicResp)
+	}
+}
+
+func (h *ProxyHandler) handleCloud(w http.ResponseWriter, r *http.Request) {
+	target := h.cloudTarget
+	proxy := httputil.NewSingleHostReverseProxy(target)
 	r.URL.Host = target.Host
 	r.URL.Scheme = target.Scheme
 	r.Header.Set("X-Forwarded-Host", r.Header.Get("Host"))
 	r.Host = target.Host
-
 	proxy.ServeHTTP(w, r)
 }
