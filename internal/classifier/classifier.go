@@ -13,28 +13,14 @@ import (
 	"github.com/abhishekjha17/intern/internal/models"
 )
 
-const classifierTimeout = 2 * time.Second
+const classifierTimeout = 5 * time.Second
 
-const systemPrompt = `You are a routing classifier. Decide whether a user's request can be handled by a small local language model or needs a powerful cloud model.
+const systemPrompt = `Classify the user's request as LOCAL or CLOUD. Output ONLY the single word LOCAL or CLOUD, nothing else.
 
-Reply with exactly one word: LOCAL or CLOUD.
+LOCAL = simple tasks: basic code, formatting, short Q&A, summarization, simple math.
+CLOUD = complex tasks: deep reasoning, multi-step analysis, expert knowledge, long creative writing, architecture design.
 
-Route LOCAL when the request is:
-- Simple code generation (boilerplate, regex, small functions)
-- Text formatting or rewriting
-- Simple Q&A with common knowledge
-- Summarization of provided text
-- Simple math or logic
-
-Route CLOUD when the request is:
-- Complex reasoning or multi-step analysis
-- Tasks requiring deep domain expertise
-- Long-form creative writing
-- Tasks involving tool use or function calling
-- Complex code architecture or debugging
-- Anything ambiguous or unclear
-
-If unsure, reply CLOUD.`
+Default: CLOUD`
 
 type Classifier struct {
 	ollamaURL string
@@ -46,21 +32,32 @@ func New(ollamaURL, model string) *Classifier {
 	return &Classifier{
 		ollamaURL: ollamaURL,
 		model:     model,
-		client:    &http.Client{Timeout: classifierTimeout},
+		client:    &http.Client{},
 	}
 }
 
+// classifierRequest adds temperature control on top of the standard fields.
+type classifierRequest struct {
+	Model       string                 `json:"model"`
+	Messages    []models.OllamaMessage `json:"messages"`
+	MaxTokens   int                    `json:"max_tokens,omitempty"`
+	Stream      bool                   `json:"stream"`
+	Temperature float64                `json:"temperature"`
+}
+
 func (c *Classifier) Classify(req models.AnthropicRequest) string {
-	// Short-circuit: tool use always goes to cloud
-	if req.Tools != nil {
-		return "CLOUD"
+	// Check if this is a multi-turn tool conversation (contains tool_result blocks).
+	// If so, route locally — the conversation was already started locally.
+	if hasToolResults(req) {
+		log.Printf("classifier: tool_result messages present, routing LOCAL (continuing tool conversation)")
+		return "LOCAL"
 	}
 
-	// Extract last user message
+	// Extract last user message text (handles both string and content block array)
 	var lastPrompt string
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
-			lastPrompt = req.Messages[i].Content
+			lastPrompt = req.Messages[i].ExtractText()
 			break
 		}
 	}
@@ -68,15 +65,16 @@ func (c *Classifier) Classify(req models.AnthropicRequest) string {
 		return "CLOUD"
 	}
 
-	// Build classifier request to Ollama
-	ollamaReq := models.OllamaRequest{
+	// Build zero-shot classifier request
+	ollamaReq := classifierRequest{
 		Model: c.model,
 		Messages: []models.OllamaMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: lastPrompt},
 		},
-		MaxTokens: 5,
-		Stream:    false,
+		MaxTokens:   3,
+		Stream:      false,
+		Temperature: 0,
 	}
 
 	body, err := json.Marshal(ollamaReq)
@@ -119,12 +117,32 @@ func (c *Classifier) Classify(req models.AnthropicRequest) string {
 		return "CLOUD"
 	}
 
-	decision := strings.TrimSpace(strings.ToUpper(ollamaResp.Choices[0].Message.Content))
-	if decision == "LOCAL" {
-		log.Printf("classifier: decision=LOCAL for prompt: %.80s...", lastPrompt)
+	raw := ollamaResp.Choices[0].Message.Content
+	decision := strings.ToUpper(strings.TrimSpace(raw))
+	log.Printf("classifier: raw=%q prompt=%.80s", raw, lastPrompt)
+
+	// Fuzzy match: check if response contains LOCAL or CLOUD
+	if strings.Contains(decision, "LOCAL") && !strings.Contains(decision, "CLOUD") {
 		return "LOCAL"
 	}
+	if strings.Contains(decision, "CLOUD") {
+		return "CLOUD"
+	}
 
-	log.Printf("classifier: decision=CLOUD for prompt: %.80s...", lastPrompt)
+	log.Printf("classifier: unrecognized response %q, defaulting to CLOUD", raw)
 	return "CLOUD"
+}
+
+// hasToolResults checks if any message in the conversation contains tool_result blocks.
+// This indicates a multi-turn tool conversation that should continue locally.
+func hasToolResults(req models.AnthropicRequest) bool {
+	for _, msg := range req.Messages {
+		blocks := msg.ParseContentBlocks()
+		for _, b := range blocks {
+			if b.Type == "tool_result" {
+				return true
+			}
+		}
+	}
+	return false
 }
