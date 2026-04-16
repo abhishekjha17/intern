@@ -76,17 +76,36 @@ func thinkingTokensFromContent(blocks []anthropicContentBlock) int {
 
 // sseMessageStart is the shape of the data payload for "message_start" SSE events.
 type sseMessageStart struct {
+	Type    string            `json:"type"`
 	Message anthropicResponse `json:"message"`
 }
 
 // sseMessageDelta is the shape of the data payload for "message_delta" SSE events.
 type sseMessageDelta struct {
+	Type  string         `json:"type"`
 	Usage anthropicUsage `json:"usage"`
 }
 
+// sseContentBlockStart is the shape of the data payload for "content_block_start" SSE events.
+type sseContentBlockStart struct {
+	ContentBlock anthropicContentBlock `json:"content_block"`
+}
+
+// sseContentBlockDelta is the shape of the data payload for "content_block_delta" SSE events.
+type sseContentBlockDelta struct {
+	Delta struct {
+		Type     string `json:"type"`
+		Thinking string `json:"thinking"` // populated for thinking_delta
+	} `json:"delta"`
+}
+
 // usageFromSSE parses an SSE response body and extracts aggregated usage info
-// from the message_start and message_delta events.
+// by scanning message_start, content_block_start, content_block_delta, and
+// message_delta events. Thinking text is accumulated from thinking_delta events
+// since message_start always carries an empty content array in streaming responses.
 func usageFromSSE(body string) (usage anthropicUsage, content []anthropicContentBlock) {
+	var thinkingBuf strings.Builder
+
 	scanner := bufio.NewScanner(strings.NewReader(body))
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -95,20 +114,35 @@ func usageFromSSE(body string) (usage anthropicUsage, content []anthropicContent
 		}
 		data := strings.TrimPrefix(line, "data: ")
 
-		// Try message_start — carries initial usage and content blocks.
+		// Try message_start — carries initial usage.
 		var ms sseMessageStart
-		if json.Unmarshal([]byte(data), &ms) == nil && ms.Message.Usage.InputTokens > 0 {
+		if json.Unmarshal([]byte(data), &ms) == nil && ms.Type == "message_start" {
 			usage.InputTokens = ms.Message.Usage.InputTokens
 			usage.CacheReadInputTokens = ms.Message.Usage.CacheReadInputTokens
-			content = ms.Message.Content
+		}
+
+		// Try content_block_delta — accumulate thinking text from thinking_delta events.
+		var cbd sseContentBlockDelta
+		if json.Unmarshal([]byte(data), &cbd) == nil && cbd.Delta.Type == "thinking_delta" {
+			thinkingBuf.WriteString(cbd.Delta.Thinking)
 		}
 
 		// Try message_delta — carries final output token count.
 		var md sseMessageDelta
-		if json.Unmarshal([]byte(data), &md) == nil && md.Usage.OutputTokens > 0 {
+		if json.Unmarshal([]byte(data), &md) == nil && md.Type == "message_delta" {
 			usage.OutputTokens = md.Usage.OutputTokens
 		}
 	}
+
+	// Build content blocks from accumulated thinking text so
+	// thinkingTokensFromContent can estimate the thinking token count.
+	if thinkingBuf.Len() > 0 {
+		content = append(content, anthropicContentBlock{
+			Type:     "thinking",
+			Thinking: thinkingBuf.String(),
+		})
+	}
+
 	return usage, content
 }
 
