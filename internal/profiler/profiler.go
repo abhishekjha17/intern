@@ -73,6 +73,16 @@ func Analyze(traces []logger.Trace, files []string) *ProfileReport {
 	var totalCost float64
 	var offloadSavings float64
 
+	// Context & memory accumulators
+	sessionLastMsgCount := map[string]int{}
+	var totalMsgCount, maxMsgCount int
+	var totalSystemPromptSize int
+	var compactionEvents int
+	var contextGrowthSteps, contextGrowthTotal int
+	var totalMemoryFilesLoaded, maxMemoryFilesLoaded int
+	memoryFileAccess := map[string]*FileAccessCount{}
+	var totalMemoryOps int
+
 	thinking := ThinkingAnalysis{TotalMessages: len(traces)}
 
 	for i, t := range traces {
@@ -108,6 +118,10 @@ func Analyze(traces []logger.Trace, files []string) *ProfileReport {
 			MaxTokens:           maxTokens,
 			BashCommands:        rf.BashCommands,
 			HasToolResult:       extractHasToolResult(t.Request),
+			MessageCount:        extractMessageCount(t.Request),
+			SystemPromptSize:    extractSystemPromptSize(t.Request),
+			MemoryFilesLoaded:   extractMemoryFiles(t.Request),
+			MemoryOperations:    rf.MemoryOps,
 		}
 
 		// Classify
@@ -192,6 +206,45 @@ func Analyze(traces []logger.Trace, files []string) *ProfileReport {
 		if msg.IsOffloadCandidate {
 			offloadReasons[msg.OffloadReason]++
 			offloadSavings += cost
+		}
+
+		// Context stats
+		totalMsgCount += msg.MessageCount
+		if msg.MessageCount > maxMsgCount {
+			maxMsgCount = msg.MessageCount
+		}
+		totalSystemPromptSize += msg.SystemPromptSize
+
+		if prevCount, ok := sessionLastMsgCount[t.SessionID]; ok {
+			if msg.MessageCount < prevCount {
+				report.Messages[len(report.Messages)-1].IsCompactionEvent = true
+				compactionEvents++
+			} else if msg.MessageCount > prevCount {
+				contextGrowthTotal += msg.MessageCount - prevCount
+				contextGrowthSteps++
+			}
+		}
+		sessionLastMsgCount[t.SessionID] = msg.MessageCount
+
+		// Memory files loaded
+		totalMemoryFilesLoaded += len(msg.MemoryFilesLoaded)
+		if len(msg.MemoryFilesLoaded) > maxMemoryFilesLoaded {
+			maxMemoryFilesLoaded = len(msg.MemoryFilesLoaded)
+		}
+
+		// Memory operations
+		for _, op := range msg.MemoryOperations {
+			totalMemoryOps++
+			fac, ok := memoryFileAccess[op.Path]
+			if !ok {
+				fac = &FileAccessCount{Path: op.Path}
+				memoryFileAccess[op.Path] = fac
+			}
+			if op.Type == "read" {
+				fac.Reads++
+			} else {
+				fac.Writes++
+			}
 		}
 
 		totalCost += cost
@@ -310,6 +363,47 @@ func Analyze(traces []logger.Trace, files []string) *ProfileReport {
 	sort.Slice(report.Offload.ByReason, func(i, j int) bool {
 		return report.Offload.ByReason[i].Count > report.Offload.ByReason[j].Count
 	})
+
+	// Finalize context analysis
+	n := float64(len(traces))
+	if n > 0 {
+		report.Context.AvgMessageCount = float64(totalMsgCount) / n
+		report.Context.AvgSystemPromptSize = int(float64(totalSystemPromptSize) / n)
+	}
+	report.Context.MaxMessageCount = maxMsgCount
+	report.Context.CompactionEvents = compactionEvents
+	if contextGrowthSteps > 0 {
+		report.Context.ContextGrowthRate = float64(contextGrowthTotal) / float64(contextGrowthSteps)
+	}
+
+	// Finalize memory analysis
+	totalReads := 0
+	totalWrites := 0
+	for _, fac := range memoryFileAccess {
+		totalReads += fac.Reads
+		totalWrites += fac.Writes
+	}
+	report.Memory.TotalRecalls = totalReads
+	report.Memory.TotalWrites = totalWrites
+	report.Memory.UniqueFilesAccessed = len(memoryFileAccess)
+	for _, fac := range memoryFileAccess {
+		total := fac.Reads + fac.Writes
+		pct := 0.0
+		if totalMemoryOps > 0 {
+			pct = float64(total) / float64(totalMemoryOps) * 100
+		}
+		fac.Percentage = pct
+		report.Memory.FileAccessCounts = append(report.Memory.FileAccessCounts, *fac)
+	}
+	sort.Slice(report.Memory.FileAccessCounts, func(i, j int) bool {
+		a := report.Memory.FileAccessCounts[i]
+		b := report.Memory.FileAccessCounts[j]
+		return (a.Reads + a.Writes) > (b.Reads + b.Writes)
+	})
+	if n > 0 {
+		report.Memory.AvgMemoryFilesLoaded = float64(totalMemoryFilesLoaded) / n
+	}
+	report.Memory.MaxMemoryFilesLoaded = maxMemoryFilesLoaded
 
 	return report
 }

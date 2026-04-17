@@ -547,6 +547,141 @@ func TestAnalyze(t *testing.T) {
 	}
 }
 
+// --------------- context & memory tests ---------------
+
+func TestExtractSystemPromptSize(t *testing.T) {
+	req := `{"system":[{"type":"text","text":"You are Claude."},{"type":"text","text":"Memory content here."}],"messages":[]}`
+	got := extractSystemPromptSize(req)
+	if got == 0 {
+		t.Error("expected non-zero system prompt size")
+	}
+	// Empty system
+	if extractSystemPromptSize(`{"messages":[]}`) != 0 {
+		t.Error("expected 0 for missing system field")
+	}
+}
+
+func TestExtractMemoryFiles(t *testing.T) {
+	req := `{"system":[{"type":"text","text":"Content from .claude/agents/expert.md and .claude/skills/review/SKILL.md loaded"}],"messages":[]}`
+	files := extractMemoryFiles(req)
+	if len(files) != 2 {
+		t.Fatalf("got %d files, want 2: %v", len(files), files)
+	}
+	if files[0] != ".claude/agents/expert.md" {
+		t.Errorf("files[0] = %q, want .claude/agents/expert.md", files[0])
+	}
+	if files[1] != ".claude/skills/review/SKILL.md" {
+		t.Errorf("files[1] = %q, want .claude/skills/review/SKILL.md", files[1])
+	}
+	// Deduplication
+	req2 := `{"system":[{"type":"text","text":".claude/a.md and .claude/a.md again"}],"messages":[]}`
+	if len(extractMemoryFiles(req2)) != 1 {
+		t.Error("expected deduplication")
+	}
+}
+
+func TestExtractResponse_SSE_MemoryOps(t *testing.T) {
+	sse := lines(
+		"event: content_block_start",
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"Read"}}`,
+		"event: content_block_delta",
+		fmt.Sprintf(`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"%s"}}`,
+			`{\"file_path\":\"/home/user/.claude/agents/expert.md\"}`),
+		"event: content_block_stop",
+		`data: {"type":"content_block_stop","index":0}`,
+	)
+	rf := ExtractResponse(sse)
+	if len(rf.MemoryOps) != 1 {
+		t.Fatalf("got %d memory ops, want 1", len(rf.MemoryOps))
+	}
+	if rf.MemoryOps[0].Type != "read" {
+		t.Errorf("op type = %q, want read", rf.MemoryOps[0].Type)
+	}
+	if !strings.Contains(rf.MemoryOps[0].Path, ".claude/") {
+		t.Errorf("path = %q, want .claude/ path", rf.MemoryOps[0].Path)
+	}
+}
+
+func TestExtractResponse_JSON_MemoryOps(t *testing.T) {
+	resp := `{"content":[{"type":"tool_use","name":"Write","id":"t1","input":{"file_path":"/home/user/.claude/memory.md","content":"notes"}},{"type":"tool_use","name":"Read","id":"t2","input":{"file_path":"/home/user/code/main.go"}}]}`
+	rf := ExtractResponse(resp)
+	if len(rf.MemoryOps) != 1 {
+		t.Fatalf("got %d memory ops, want 1 (only .claude/ paths)", len(rf.MemoryOps))
+	}
+	if rf.MemoryOps[0].Type != "write" {
+		t.Errorf("op type = %q, want write", rf.MemoryOps[0].Type)
+	}
+}
+
+func TestAnalyze_ContextAndMemory(t *testing.T) {
+	now := time.Now()
+	traces := []logger.Trace{
+		{
+			Timestamp: now, SessionID: "s1", Model: "claude-sonnet-4-5-20241022",
+			InputTokens: 1000, OutputTokens: 200,
+			Request:  `{"max_tokens":16000,"system":[{"type":"text","text":"Content from .claude/agents/expert.md"}],"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"},{"role":"user","content":"go"}]}`,
+			Response: `{"content":[{"type":"text","text":"hello"}]}`,
+		},
+		{
+			Timestamp: now.Add(time.Minute), SessionID: "s1", Model: "claude-sonnet-4-5-20241022",
+			InputTokens: 2000, OutputTokens: 300,
+			Request:  `{"max_tokens":16000,"system":[{"type":"text","text":"Content from .claude/agents/expert.md"}],"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"},{"role":"user","content":"go"},{"role":"assistant","content":"done"},{"role":"user","content":"next"}]}`,
+			Response: `{"content":[{"type":"tool_use","name":"Read","id":"r1","input":{"file_path":"/home/user/.claude/agents/expert.md"}}]}`,
+		},
+		{
+			// Compaction: message count drops from 5 to 3
+			Timestamp: now.Add(2 * time.Minute), SessionID: "s1", Model: "claude-sonnet-4-5-20241022",
+			InputTokens: 800, OutputTokens: 100,
+			Request:  `{"max_tokens":16000,"system":[{"type":"text","text":"Compacted"}],"messages":[{"role":"user","content":"summary"},{"role":"assistant","content":"ok"},{"role":"user","content":"continue"}]}`,
+			Response: `{"content":[{"type":"text","text":"ok"}]}`,
+		},
+	}
+
+	report := Analyze(traces, []string{"test.jsonl"})
+
+	// Context checks
+	if report.Context.MaxMessageCount != 5 {
+		t.Errorf("max message count = %d, want 5", report.Context.MaxMessageCount)
+	}
+	if report.Context.CompactionEvents != 1 {
+		t.Errorf("compaction events = %d, want 1", report.Context.CompactionEvents)
+	}
+	if report.Context.AvgMessageCount < 3.0 {
+		t.Errorf("avg message count = %.1f, want >= 3.0", report.Context.AvgMessageCount)
+	}
+	if report.Context.ContextGrowthRate < 1.0 {
+		t.Errorf("growth rate = %.1f, want >= 1.0", report.Context.ContextGrowthRate)
+	}
+
+	// Compaction flag on message
+	if !report.Messages[2].IsCompactionEvent {
+		t.Error("msg[2] should be a compaction event")
+	}
+	if report.Messages[0].IsCompactionEvent || report.Messages[1].IsCompactionEvent {
+		t.Error("msg[0] and msg[1] should not be compaction events")
+	}
+
+	// Memory checks
+	if report.Memory.TotalRecalls != 1 {
+		t.Errorf("total recalls = %d, want 1", report.Memory.TotalRecalls)
+	}
+	if report.Memory.TotalWrites != 0 {
+		t.Errorf("total writes = %d, want 0", report.Memory.TotalWrites)
+	}
+	if report.Memory.UniqueFilesAccessed != 1 {
+		t.Errorf("unique files = %d, want 1", report.Memory.UniqueFilesAccessed)
+	}
+
+	// Memory files loaded from system prompt
+	if len(report.Messages[0].MemoryFilesLoaded) != 1 {
+		t.Errorf("msg[0] memory files = %d, want 1", len(report.Messages[0].MemoryFilesLoaded))
+	}
+	// Compacted message has no .claude/ paths
+	if len(report.Messages[2].MemoryFilesLoaded) != 0 {
+		t.Errorf("msg[2] memory files = %d, want 0", len(report.Messages[2].MemoryFilesLoaded))
+	}
+}
+
 // helper to join lines with newlines
 func lines(ss ...string) string {
 	return strings.Join(ss, "\n") + "\n"
