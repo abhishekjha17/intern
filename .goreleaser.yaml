@@ -21,11 +21,13 @@ builds:
       - arm64
 
 archives:
-  - format: tar.gz
+  - formats:
+      - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
-        format: zip
+        formats:
+          - zip
     files:
       - README.md
       - LICENSE
@@ -49,7 +51,7 @@ brews:
       owner: abhishekjha17
       name: homebrew-intern
       branch: main
-    folder: Formula
+    directory: Formula
     homepage: "https://github.com/abhishekjha17/intern"
     description: "Proxy and profiler for Anthropic Claude API sessions"
     license: "GPL-3.0"
