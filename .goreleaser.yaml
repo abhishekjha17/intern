@@ -51,6 +51,7 @@ brews:
       owner: abhishekjha17
       name: homebrew-intern
       branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
     homepage: "https://github.com/abhishekjha17/intern"
     description: "Proxy and profiler for Anthropic Claude API sessions"
