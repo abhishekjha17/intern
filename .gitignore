@@ -2,7 +2,7 @@
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
 # Binaries for programs and plugins
-intern
+/intern
 *.exe
 *.exe~
 *.dll
@@ -12,7 +12,18 @@ intern
 # Test binary, built with `go test -c`
 *.test
 
+# TODO file
+todo.md
+
+# Workiing Directory Files
 **/build
+**/traces
+
+# Trace files
+*.jsonl
+
+# GoReleaser output
+dist/
 
 # Code coverage profiles and other test artifacts
 *.out

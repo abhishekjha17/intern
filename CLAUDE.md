@@ -1,108 +1,117 @@
-# Intern — Agent Design Document
+# Intern — Design Document
 
-Intern is an LLM routing proxy that sits between Anthropic API clients (Claude Code, Cursor, etc.) and LLM backends. It accepts Anthropic Messages API requests, classifies them by complexity, and routes simple requests to a local Ollama model while passing complex requests through to the Anthropic cloud API. The proxy is fully transparent — clients don't know they're talking to a proxy.
+Intern is a transparent proxy and profiler for the Anthropic Claude API. It sits between Claude clients (Claude Code, Cursor, etc.) and `api.anthropic.com`, captures every request/response as structured JSONL traces, and provides offline analysis of cost, token usage, tool calls, and conversation patterns.
 
 ## Architecture
 
 ```
 Client (Claude Code / Cursor)
   │
-  ▼  Anthropic Messages API format
-┌─────────────────────────┐
-│     ProxyHandler        │  :11411
-│  (internal/proxy)       │
-├─────────────────────────┤
-│       Router            │
-│  (internal/router)      │
-├─────────────────────────┤
-│     Classifier          │  Calls Ollama with zero-shot prompt
-│  (internal/classifier)  │  Returns LOCAL or CLOUD
-└────────┬────────┬───────┘
-         │        │
-    LOCAL │        │ CLOUD
-         ▼        ▼
-   ┌──────────┐  ┌──────────────┐
-   │  Ollama  │  │  Anthropic   │
-   │ :11434   │  │  Cloud API   │
-   └──────────┘  └──────────────┘
+  ▼  Anthropic Messages API
+┌─────────────────────────────┐
+│   httputil.ReverseProxy     │  :8080
+│   + LoggingRoundTripper     │
+│   (cmd/intern, internal/    │
+│    logger)                  │
+└─────────┬───────────────────┘
+          │
+          ▼
+   ┌──────────────┐       ┌─────────────────┐
+   │  Anthropic   │       │  traces.jsonl    │
+   │  Cloud API   │       │  (async write)   │
+   └──────────────┘       └─────────────────┘
+                                  │
+                                  ▼
+                          ┌───────────────┐
+                          │ intern profile │
+                          │ (profiler pkg) │
+                          └───────────────┘
 ```
-
-## Request Flow
-
-1. `ProxyHandler.ServeHTTP` receives request, unmarshals into `AnthropicRequest`
-2. `Router.Decide` calls `Classifier.Classify` which:
-   - Short-circuits to LOCAL if `tool_result` blocks are present (continuing a tool conversation)
-   - Extracts text from the last user message via `Message.ExtractText()`
-   - Sends it to a small Ollama model with a zero-shot classification prompt
-   - Returns `"LOCAL"` or `"CLOUD"` (defaults to CLOUD on any error)
-3. **LOCAL path**: `translator.AnthropicToOllama()` converts the request, POSTs to Ollama's `/v1/chat/completions`, then `translator.OllamaToAnthropic()` or `translator.StreamOllamaToAnthropic()` converts the response back
-4. **CLOUD path**: reverse proxy passthrough to `api.anthropic.com`, untouched
 
 ## Package Layout
 
 ```
-main.go                           Entry point, flag parsing, wiring
+cmd/
+  intern/
+    main.go                       Entry point, subcommand dispatch, version
 internal/
-  models/request.go               All type definitions (Anthropic + Ollama)
-  classifier/classifier.go        LLM-based LOCAL/CLOUD classifier
-  router/bounce.go                Router (wraps classifier into RouteDecision)
-  proxy/handler.go                HTTP handler, local/cloud dispatch
-  translator/
-    request.go                    Anthropic request → Ollama request
-    response.go                   Ollama response → Anthropic response
-    stream.go                     Ollama SSE stream → Anthropic SSE stream
-test.sh                           Smoke tests (7 tests)
+  logger/
+    roundtripper.go               HTTP RoundTripper — captures request/response, writes JSONL
+    roundtripper_test.go          Tests for SSE parsing, token extraction
+  profiler/
+    types.go                      All profiler structs (MessageProfile, ProfileReport, etc.)
+    pricing.go                    Model pricing constants, CostForTokens()
+    extract.go                    Response/request parsing (SSE + JSON content blocks)
+    classify.go                   Phase, complexity, dependency, offload classifiers
+    profiler.go                   LoadTraces(), Analyze() — core profiling pipeline
+    report.go                     Text table rendering (tabwriter)
+    report_json.go                JSON output
+    profiler_test.go              Unit tests for all analysis functions
+.claude/
+  agents/                         Custom Claude Code subagents (reviewer, bug-finder, etc.)
+  skills/                         Slash commands (/review, /explain, /write-tests, etc.)
+Makefile                          Build, test, lint, install targets
+.goreleaser.yaml                  Cross-platform release configuration
+.github/workflows/
+  ci.yml                          Test + lint on push/PR
+  release.yml                     GoReleaser on tag push
 ```
 
-## Key Types
+## Proxy
 
-**`models.Message`** — Anthropic message with `Content json.RawMessage`. Content is either a plain JSON string `"hello"` or a content block array `[{"type":"text","text":"..."}, {"type":"tool_use",...}]`. Use `ExtractText()` for plain text or `ParseContentBlocks()` for the array form.
+The proxy uses `httputil.NewSingleHostReverseProxy` with a custom `http.RoundTripper` (`LoggingRoundTripper`) that:
 
-**`models.ContentBlock`** — Union struct covering `text`, `tool_use`, and `tool_result` block types. Fields are tagged `omitempty` so only relevant ones serialize.
+1. Captures the full request body before forwarding
+2. Tees the response body while streaming it back to the client
+3. Parses SSE events to extract token usage (input, output, cache read, cache creation, thinking)
+4. Derives a session ID from SHA256 of the first message in the conversation
+5. Writes a `Trace` record as JSONL to disk via a buffered async writer
 
-**`models.AnthropicRequest`** — `System` and `Tools` are both `json.RawMessage` (can be string or array). Use `ExtractSystemText()`, `HasTools()`, `ParseTools()`.
+The proxy is fully transparent — clients see standard Anthropic API responses with no modification.
 
-## Format Translation
+## Profiler
 
-The translator handles these mappings between Anthropic and OpenAI/Ollama formats:
+The profiler reads JSONL trace files and produces a `ProfileReport` with:
 
-| Concept | Anthropic | OpenAI/Ollama |
-|---------|-----------|---------------|
-| Tool definition | `{name, description, input_schema}` | `{type:"function", function:{name, description, parameters}}` |
-| Tool invocation | Content block: `{type:"tool_use", id, name, input}` | `message.tool_calls[]: {id, type:"function", function:{name, arguments}}` |
-| Tool result | User message content block: `{type:"tool_result", tool_use_id, content}` | Separate message: `{role:"tool", tool_call_id, content}` |
-| Stop reason | `"end_turn"`, `"tool_use"`, `"max_tokens"` | `"stop"`, `"tool_calls"`, `"length"` |
-| Streaming | `event: content_block_start/delta/stop` per block | Single `data:` lines with `delta` object |
+### Per-Message Classification
+- **Phase**: exploration, execution, verification, planning, conversation — determined by tool names and bash command patterns
+- **Complexity**: trivial, mechanical, reasoning, creative — score-based heuristic using output volume, tool count/diversity, thinking presence
+- **Dependency**: independent, tool_continuation, conversation_continuation — based on message array structure
+- **Offload candidacy**: identifies messages suitable for local models (health checks, trivial tasks, tool continuations)
 
-## Streaming Translation
+### Aggregate Reports
+- Cost breakdown by model (input, output, cache read, cache creation)
+- Token averages by model
+- Tool usage frequency
+- Content block type distribution
+- Session summaries (cost, duration, models, phases)
+- Thinking analysis (with text vs. signature-only)
+- Offload savings estimates
 
-Ollama sends tool calls all at once in one delta chunk (not incrementally). The stream translator:
-1. Emits `message_start` immediately
-2. Lazily emits `content_block_start` for text only when text arrives
-3. On `delta.tool_calls`: closes any open text block, then for each tool call emits `content_block_start` (type:tool_use) → `content_block_delta` (input_json_delta) → `content_block_stop`
-4. Emits `message_delta` with `stop_reason` and `message_stop`
+## CLI
 
-## Classifier Behavior
-
-- Uses zero-shot prompt with `temperature: 0`, `max_tokens: 3`
-- 5-second timeout, falls back to CLOUD on any error
-- Fuzzy matches response for "LOCAL" or "CLOUD" keywords
-- **Tool result short-circuit**: if any message contains `tool_result` blocks, routes LOCAL immediately (assumes ongoing local tool conversation)
+```
+intern [flags]                         Run proxy (default)
+intern proxy --port 8080 --trace f.jsonl
+intern profile [--json] <files...>     Analyze traces
+intern --version
+```
 
 ## Build & Test
 
 ```bash
-go build ./...           # zero external dependencies
-go run .                 # starts on :11411
-./test.sh                # 7 smoke tests (requires running proxy + Ollama)
+make build        # builds ./intern with version injection
+make test         # go test -race ./...
+make lint         # go vet ./...
+make install      # go install to $GOPATH/bin
 ```
 
-## CLI Flags
+## Roadmap
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-port` | `11411` | Proxy listen port |
-| `-ollama` | `http://localhost:11434` | Ollama URL |
-| `-cloud` | `https://api.anthropic.com` | Anthropic API URL |
-| `-model` | `qwen2.5:3b` | Ollama model for inference |
-| `-classifier-model` | `qwen2.5:3b` | Ollama model for routing classification |
+The following features are planned but not yet implemented:
+
+- **Multi-model routing** — Classify requests by complexity, route simple ones to local Ollama models, pass complex ones to cloud API
+- **Configurable routing rules** — User-defined routing based on tools, token count, or conversation phase
+- **Web dashboard** — Browser-based visualization of traces and cost trends
+- **Real-time profiling** — Live cost stats while the proxy is running
+- **Budget alerts** — Spending thresholds with notifications

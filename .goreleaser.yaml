@@ -1,0 +1,81 @@
+version: 2
+
+project_name: intern
+
+builds:
+  - main: ./cmd/intern
+    binary: intern
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.Commit={{.ShortCommit}}
+      - -X main.Date={{.Date}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE
+      - .claude/agents/*
+      - .claude/skills/*/SKILL.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^ci:"
+
+brews:
+  - repository:
+      owner: abhishekjha17
+      name: homebrew-intern
+      branch: main
+    folder: Formula
+    homepage: "https://github.com/abhishekjha17/intern"
+    description: "Proxy and profiler for Anthropic Claude API sessions"
+    license: "GPL-3.0"
+    install: |
+      bin.install "intern"
+    service: |
+      run [opt_bin/"intern", "proxy", "--port", "11411", "--trace", var/"log/intern/traces.jsonl"]
+      keep_alive true
+      log_path var/"log/intern/intern.log"
+      error_log_path var/"log/intern/intern.log"
+    post_install: |
+      (var/"log/intern").mkpath
+    caveats: |
+      To start intern as a background service:
+        brew services start intern
+
+      The proxy listens on http://localhost:11411 by default.
+      Point your Claude client's API base URL there.
+
+      Traces are written to:
+        #{var}/log/intern/traces.jsonl
+
+      To analyze your traces:
+        intern profile #{var}/log/intern/traces.jsonl
+
+release:
+  github:
+    owner: abhishekjha17
+    name: intern

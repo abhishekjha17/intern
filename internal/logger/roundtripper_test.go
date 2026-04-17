@@ -37,7 +37,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 event: message_stop
 data: {"type":"message_stop"}
 `
-	usage, content := usageFromSSE(body)
+	usage, content := UsageFromSSE(body)
 
 	if usage.InputTokens != 100 {
 		t.Errorf("InputTokens = %d, want 100", usage.InputTokens)
@@ -57,13 +57,13 @@ data: {"type":"message_stop"}
 		t.Errorf("Thinking = %q, want %q", content[0].Thinking, wantThinking)
 	}
 
-	tokens := thinkingTokensFromContent(content)
+	tokens := ThinkingTokensFromContent(content)
 	if tokens == 0 {
-		t.Error("thinkingTokensFromContent returned 0, want > 0")
+		t.Error("ThinkingTokensFromContent returned 0, want > 0")
 	}
 	// 74 chars / 4 = 18 tokens
 	if tokens != 18 {
-		t.Errorf("thinkingTokensFromContent = %d, want 18", tokens)
+		t.Errorf("ThinkingTokensFromContent = %d, want 18", tokens)
 	}
 }
 
@@ -87,7 +87,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 event: message_stop
 data: {"type":"message_stop"}
 `
-	usage, content := usageFromSSE(body)
+	usage, content := UsageFromSSE(body)
 
 	if usage.InputTokens != 50 {
 		t.Errorf("InputTokens = %d, want 50", usage.InputTokens)
@@ -98,8 +98,8 @@ data: {"type":"message_stop"}
 	if len(content) != 0 {
 		t.Errorf("expected 0 content blocks, got %d", len(content))
 	}
-	if thinkingTokensFromContent(content) != 0 {
-		t.Error("thinkingTokensFromContent should be 0 with no thinking blocks")
+	if ThinkingTokensFromContent(content) != 0 {
+		t.Error("ThinkingTokensFromContent should be 0 with no thinking blocks")
 	}
 }
 
@@ -133,7 +133,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 event: message_stop
 data: {"type":"message_stop"}
 `
-	usage, content := usageFromSSE(body)
+	usage, content := UsageFromSSE(body)
 
 	if usage.OutputTokens != 150 {
 		t.Errorf("OutputTokens = %d, want 150", usage.OutputTokens)
@@ -142,8 +142,8 @@ data: {"type":"message_stop"}
 	if len(content) != 0 {
 		t.Errorf("expected 0 content blocks for redacted thinking, got %d", len(content))
 	}
-	if thinkingTokensFromContent(content) != 0 {
-		t.Errorf("thinkingTokensFromContent should be 0 for redacted thinking")
+	if ThinkingTokensFromContent(content) != 0 {
+		t.Errorf("ThinkingTokensFromContent should be 0 for redacted thinking")
 	}
 }
 
@@ -168,7 +168,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 event: message_stop
 data: {"type":"message_stop"}
 `
-	usage, _ := usageFromSSE(body)
+	usage, _ := UsageFromSSE(body)
 
 	if usage.InputTokens != 0 {
 		t.Errorf("InputTokens = %d, want 0", usage.InputTokens)
@@ -204,7 +204,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"outpu
 event: message_stop
 data: {"type":"message_stop"}
 `
-	usage, content := usageFromSSE(body)
+	usage, content := UsageFromSSE(body)
 
 	if usage.InputTokens != 500 {
 		t.Errorf("InputTokens = %d, want 500", usage.InputTokens)
@@ -262,7 +262,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"outpu
 event: message_stop
 data: {"type":"message_stop"}
 `
-	usage, content := usageFromSSE(body)
+	usage, content := UsageFromSSE(body)
 
 	if usage.InputTokens != 2 {
 		t.Errorf("InputTokens = %d, want 2", usage.InputTokens)
@@ -277,7 +277,7 @@ data: {"type":"message_stop"}
 		t.Errorf("Thinking = %q", content[0].Thinking)
 	}
 	// 38 chars / 4 = 9
-	if got := thinkingTokensFromContent(content); got != 9 {
-		t.Errorf("thinkingTokensFromContent = %d, want 9", got)
+	if got := ThinkingTokensFromContent(content); got != 9 {
+		t.Errorf("ThinkingTokensFromContent = %d, want 9", got)
 	}
 }

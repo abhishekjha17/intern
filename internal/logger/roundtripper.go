@@ -37,34 +37,37 @@ type logEntry struct {
 	contentType string
 }
 
-// anthropicUsage mirrors the usage object returned by the Anthropic API.
-type anthropicUsage struct {
-	InputTokens          int `json:"input_tokens"`
-	OutputTokens         int `json:"output_tokens"`
+// AnthropicUsage mirrors the usage object returned by the Anthropic API.
+type AnthropicUsage struct {
+	InputTokens               int `json:"input_tokens"`
+	OutputTokens              int `json:"output_tokens"`
 	// ThinkingTokens is populated when the API explicitly breaks out thinking
 	// token usage (possible in future API versions). Currently, thinking tokens
 	// are bundled into OutputTokens by Anthropic, so this field will typically
-	// be zero and thinkingTokensFromContent is used instead.
-	ThinkingTokens       int `json:"thinking_tokens"`
-	CacheReadInputTokens int `json:"cache_read_input_tokens"`
+	// be zero and ThinkingTokensFromContent is used instead.
+	ThinkingTokens            int `json:"thinking_tokens"`
+	CacheReadInputTokens      int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens  int `json:"cache_creation_input_tokens"`
 }
 
-// anthropicContentBlock represents a single block in the response content array.
-type anthropicContentBlock struct {
+// AnthropicContentBlock represents a single block in the response content array.
+type AnthropicContentBlock struct {
 	Type     string `json:"type"`
-	Thinking string `json:"thinking"` // non-empty for type=="thinking" blocks
+	Name     string `json:"name,omitempty"`     // tool name for tool_use/server_tool_use blocks
+	Thinking string `json:"thinking,omitempty"` // non-empty for type=="thinking" blocks
 }
 
-type anthropicResponse struct {
-	Content []anthropicContentBlock `json:"content"`
-	Usage   anthropicUsage          `json:"usage"`
+// AnthropicResponse is the top-level response structure from the Anthropic API.
+type AnthropicResponse struct {
+	Content []AnthropicContentBlock `json:"content"`
+	Usage   AnthropicUsage          `json:"usage"`
 }
 
-// thinkingTokensFromContent estimates the number of thinking tokens by summing
+// ThinkingTokensFromContent estimates the number of thinking tokens by summing
 // the character lengths of all type="thinking" content blocks and dividing by 4
 // (the standard approximation of 1 token ≈ 4 characters). It is only used when
 // the usage object does not provide an explicit thinking token count.
-func thinkingTokensFromContent(blocks []anthropicContentBlock) int {
+func ThinkingTokensFromContent(blocks []AnthropicContentBlock) int {
 	var chars int
 	for _, b := range blocks {
 		if b.Type == "thinking" {
@@ -74,36 +77,36 @@ func thinkingTokensFromContent(blocks []anthropicContentBlock) int {
 	return chars / 4
 }
 
-// sseMessageStart is the shape of the data payload for "message_start" SSE events.
-type sseMessageStart struct {
+// SSEMessageStart is the shape of the data payload for "message_start" SSE events.
+type SSEMessageStart struct {
 	Type    string            `json:"type"`
-	Message anthropicResponse `json:"message"`
+	Message AnthropicResponse `json:"message"`
 }
 
-// sseMessageDelta is the shape of the data payload for "message_delta" SSE events.
-type sseMessageDelta struct {
+// SSEMessageDelta is the shape of the data payload for "message_delta" SSE events.
+type SSEMessageDelta struct {
 	Type  string         `json:"type"`
-	Usage anthropicUsage `json:"usage"`
+	Usage AnthropicUsage `json:"usage"`
 }
 
-// sseContentBlockStart is the shape of the data payload for "content_block_start" SSE events.
-type sseContentBlockStart struct {
-	ContentBlock anthropicContentBlock `json:"content_block"`
+// SSEContentBlockStart is the shape of the data payload for "content_block_start" SSE events.
+type SSEContentBlockStart struct {
+	ContentBlock AnthropicContentBlock `json:"content_block"`
 }
 
-// sseContentBlockDelta is the shape of the data payload for "content_block_delta" SSE events.
-type sseContentBlockDelta struct {
+// SSEContentBlockDelta is the shape of the data payload for "content_block_delta" SSE events.
+type SSEContentBlockDelta struct {
 	Delta struct {
 		Type     string `json:"type"`
 		Thinking string `json:"thinking"` // populated for thinking_delta
 	} `json:"delta"`
 }
 
-// usageFromSSE parses an SSE response body and extracts aggregated usage info
+// UsageFromSSE parses an SSE response body and extracts aggregated usage info
 // by scanning message_start, content_block_start, content_block_delta, and
 // message_delta events. Thinking text is accumulated from thinking_delta events
 // since message_start always carries an empty content array in streaming responses.
-func usageFromSSE(body string) (usage anthropicUsage, content []anthropicContentBlock) {
+func UsageFromSSE(body string) (usage AnthropicUsage, content []AnthropicContentBlock) {
 	var thinkingBuf strings.Builder
 
 	scanner := bufio.NewScanner(strings.NewReader(body))
@@ -115,29 +118,30 @@ func usageFromSSE(body string) (usage anthropicUsage, content []anthropicContent
 		data := strings.TrimPrefix(line, "data: ")
 
 		// Try message_start — carries initial usage.
-		var ms sseMessageStart
+		var ms SSEMessageStart
 		if json.Unmarshal([]byte(data), &ms) == nil && ms.Type == "message_start" {
 			usage.InputTokens = ms.Message.Usage.InputTokens
 			usage.CacheReadInputTokens = ms.Message.Usage.CacheReadInputTokens
+			usage.CacheCreationInputTokens = ms.Message.Usage.CacheCreationInputTokens
 		}
 
 		// Try content_block_delta — accumulate thinking text from thinking_delta events.
-		var cbd sseContentBlockDelta
+		var cbd SSEContentBlockDelta
 		if json.Unmarshal([]byte(data), &cbd) == nil && cbd.Delta.Type == "thinking_delta" {
 			thinkingBuf.WriteString(cbd.Delta.Thinking)
 		}
 
 		// Try message_delta — carries final output token count.
-		var md sseMessageDelta
+		var md SSEMessageDelta
 		if json.Unmarshal([]byte(data), &md) == nil && md.Type == "message_delta" {
 			usage.OutputTokens = md.Usage.OutputTokens
 		}
 	}
 
 	// Build content blocks from accumulated thinking text so
-	// thinkingTokensFromContent can estimate the thinking token count.
+	// ThinkingTokensFromContent can estimate the thinking token count.
 	if thinkingBuf.Len() > 0 {
-		content = append(content, anthropicContentBlock{
+		content = append(content, AnthropicContentBlock{
 			Type:     "thinking",
 			Thinking: thinkingBuf.String(),
 		})
@@ -305,14 +309,14 @@ func (l *LoggingRoundTripper) worker() {
 	enc := json.NewEncoder(f)
 
 	for entry := range l.ch {
-		var usage anthropicUsage
-		var content []anthropicContentBlock
+		var usage AnthropicUsage
+		var content []AnthropicContentBlock
 
 		isSSE := strings.Contains(entry.contentType, "text/event-stream")
 		if isSSE {
-			usage, content = usageFromSSE(entry.response)
+			usage, content = UsageFromSSE(entry.response)
 		} else {
-			var ar anthropicResponse
+			var ar AnthropicResponse
 			if err := json.Unmarshal([]byte(entry.response), &ar); err != nil {
 				log.Printf("intern/logger: failed to parse response JSON: %v", err)
 			}
@@ -323,7 +327,7 @@ func (l *LoggingRoundTripper) worker() {
 		// Prefer the explicit field; fall back to estimating from content blocks.
 		thinkingTokens := usage.ThinkingTokens
 		if thinkingTokens == 0 {
-			thinkingTokens = thinkingTokensFromContent(content)
+			thinkingTokens = ThinkingTokensFromContent(content)
 		}
 
 		trace := Trace{
