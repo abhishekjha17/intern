@@ -4,7 +4,7 @@
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 [![CI](https://github.com/abhishekjha17/intern/actions/workflows/ci.yml/badge.svg)](https://github.com/abhishekjha17/intern/actions/workflows/ci.yml)
 
-A lightweight proxy and profiler for Anthropic Claude API sessions. Intern sits between your Claude client and the API, captures every interaction as structured traces, and gives you tools to analyze cost, token usage, tool calls, and conversation patterns.
+A lightweight proxy and profiler for Claude Code sessions. Intern sits between Claude Code client and the API, captures every interaction as structured traces, and gives you tools to analyze cost, token usage, tool calls, and conversation patterns.
 
 ## Features
 
@@ -14,8 +14,7 @@ A lightweight proxy and profiler for Anthropic Claude API sessions. Intern sits 
 - **Session Profiling** — Per-message classification: conversation phase (exploration, execution, verification, planning), complexity level, dependency chain, and offload candidacy.
 - **Thinking Analysis** — Tracks extended thinking usage: thinking blocks with text vs. signature-only (adaptive mode).
 - **Offload Detection** — Identifies messages that could be handled by a local model (health checks, trivial tasks, tool continuations) with estimated savings.
-- **Claude Code Skills & Agents** — Built-in slash commands and custom agents for code review, bug finding, test writing, security audits, and more.
-- **Zero Dependencies** — Pure Go standard library. Single static binary.
+
 
 ## Installation
 
