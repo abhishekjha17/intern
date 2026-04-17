@@ -19,6 +19,8 @@ func RenderText(w io.Writer, r *ProfileReport) {
 	renderSessions(w, r)
 	renderThinking(w, r)
 	renderOffload(w, r)
+	renderContext(w, r)
+	renderMemory(w, r)
 }
 
 func renderCost(w io.Writer, r *ProfileReport) {
@@ -139,6 +141,42 @@ func renderOffload(w io.Writer, r *ProfileReport) {
 		fmt.Fprintf(tw, "------\t-----\t-\n")
 		for _, or := range r.Offload.ByReason {
 			fmt.Fprintf(tw, "%s\t%d\t%.1f%%\n", or.Name, or.Count, or.Percentage)
+		}
+		tw.Flush()
+	}
+	fmt.Fprintln(w)
+}
+
+func renderContext(w io.Writer, r *ProfileReport) {
+	fmt.Fprintf(w, "=== Context Window Analysis ===\n\n")
+	c := r.Context
+	fmt.Fprintf(w, "Avg Message Count:       %.1f\n", c.AvgMessageCount)
+	fmt.Fprintf(w, "Max Message Count:       %d\n", c.MaxMessageCount)
+	fmt.Fprintf(w, "Avg System Prompt Size:  %d bytes\n", c.AvgSystemPromptSize)
+	fmt.Fprintf(w, "Compaction Events:       %d\n", c.CompactionEvents)
+	fmt.Fprintf(w, "Avg Context Growth/Turn: %.1f messages\n", c.ContextGrowthRate)
+	fmt.Fprintln(w)
+}
+
+func renderMemory(w io.Writer, r *ProfileReport) {
+	fmt.Fprintf(w, "=== Memory Analysis ===\n\n")
+	m := r.Memory
+	fmt.Fprintf(w, "Total Recalls (reads):    %d\n", m.TotalRecalls)
+	fmt.Fprintf(w, "Total Writes:             %d\n", m.TotalWrites)
+	fmt.Fprintf(w, "Unique Files Accessed:    %d\n", m.UniqueFilesAccessed)
+	fmt.Fprintf(w, "Avg Memory Files/Request: %.1f\n", m.AvgMemoryFilesLoaded)
+	fmt.Fprintf(w, "Max Memory Files Loaded:  %d\n\n", m.MaxMemoryFilesLoaded)
+
+	if len(m.FileAccessCounts) > 0 {
+		tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+		fmt.Fprintf(tw, "PATH\tREADS\tWRITES\t%%\n")
+		fmt.Fprintf(tw, "----\t-----\t------\t-\n")
+		for _, f := range m.FileAccessCounts {
+			path := f.Path
+			if len(path) > 50 {
+				path = "..." + path[len(path)-47:]
+			}
+			fmt.Fprintf(tw, "%s\t%d\t%d\t%.1f%%\n", path, f.Reads, f.Writes, f.Percentage)
 		}
 		tw.Flush()
 	}

@@ -3,16 +3,18 @@ package profiler
 import (
 	"bufio"
 	"encoding/json"
+	"regexp"
 	"strings"
 )
 
 // ResponseFields holds all fields extracted from a raw response in a single pass.
 type ResponseFields struct {
-	Blocks          []BlockInfo
+	Blocks           []BlockInfo
 	HasThinkingBlock bool
 	HasThinkingText  bool
 	CacheCreation    int
 	BashCommands     []string
+	MemoryOps        []MemoryOp
 }
 
 // ExtractResponse parses a raw response (SSE or JSON) in a single pass,
@@ -27,11 +29,12 @@ func ExtractResponse(response string) ResponseFields {
 func extractResponseSSE(response string) ResponseFields {
 	var rf ResponseFields
 
-	// Track Bash tool_use blocks for command extraction.
-	type bashBlock struct {
+	// Track tool_use blocks for input extraction.
+	type toolBlock struct {
+		name    string
 		jsonBuf strings.Builder
 	}
-	bashBlocks := map[int]*bashBlock{}
+	toolBlocks := map[int]*toolBlock{}
 
 	scanner := bufio.NewScanner(strings.NewReader(response))
 	for scanner.Scan() {
@@ -74,27 +77,40 @@ func extractResponseSSE(response string) ResponseFields {
 			if evt.ContentBlock.Type == "thinking" {
 				rf.HasThinkingBlock = true
 			}
-			if evt.ContentBlock.Type == "tool_use" && evt.ContentBlock.Name == "Bash" {
-				bashBlocks[evt.Index] = &bashBlock{}
+			if evt.ContentBlock.Type == "tool_use" {
+				switch evt.ContentBlock.Name {
+				case "Bash", "Read", "Write", "Edit":
+					toolBlocks[evt.Index] = &toolBlock{name: evt.ContentBlock.Name}
+				}
 			}
 
 		case "content_block_delta":
 			if evt.Delta.Type == "thinking_delta" {
 				rf.HasThinkingText = true
 			}
-			if bb, ok := bashBlocks[evt.Index]; ok && evt.Delta.Type == "input_json_delta" {
-				bb.jsonBuf.WriteString(evt.Delta.PartialJSON)
+			if tb, ok := toolBlocks[evt.Index]; ok && evt.Delta.Type == "input_json_delta" {
+				tb.jsonBuf.WriteString(evt.Delta.PartialJSON)
 			}
 
 		case "content_block_stop":
-			if bb, ok := bashBlocks[evt.Index]; ok {
+			if tb, ok := toolBlocks[evt.Index]; ok {
 				var input struct {
-					Command string `json:"command"`
+					Command  string `json:"command"`
+					FilePath string `json:"file_path"`
 				}
-				if json.Unmarshal([]byte(bb.jsonBuf.String()), &input) == nil && input.Command != "" {
-					rf.BashCommands = append(rf.BashCommands, input.Command)
+				if json.Unmarshal([]byte(tb.jsonBuf.String()), &input) == nil {
+					if tb.name == "Bash" && input.Command != "" {
+						rf.BashCommands = append(rf.BashCommands, input.Command)
+					}
+					if input.FilePath != "" && strings.Contains(input.FilePath, ".claude/") {
+						opType := "read"
+						if tb.name == "Write" || tb.name == "Edit" {
+							opType = "write"
+						}
+						rf.MemoryOps = append(rf.MemoryOps, MemoryOp{Type: opType, Path: input.FilePath})
+					}
 				}
-				delete(bashBlocks, evt.Index)
+				delete(toolBlocks, evt.Index)
 			}
 		}
 	}
@@ -109,7 +125,8 @@ func extractResponseJSON(response string) ResponseFields {
 			Name     string `json:"name"`
 			Thinking string `json:"thinking"`
 			Input    struct {
-				Command string `json:"command"`
+				Command  string `json:"command"`
+				FilePath string `json:"file_path"`
 			} `json:"input"`
 		} `json:"content"`
 		Usage struct {
@@ -130,8 +147,17 @@ func extractResponseJSON(response string) ResponseFields {
 				rf.HasThinkingText = true
 			}
 		}
-		if (c.Type == "tool_use") && c.Name == "Bash" && c.Input.Command != "" {
-			rf.BashCommands = append(rf.BashCommands, c.Input.Command)
+		if c.Type == "tool_use" {
+			if c.Name == "Bash" && c.Input.Command != "" {
+				rf.BashCommands = append(rf.BashCommands, c.Input.Command)
+			}
+			if c.Input.FilePath != "" && strings.Contains(c.Input.FilePath, ".claude/") {
+				opType := "read"
+				if c.Name == "Write" || c.Name == "Edit" {
+					opType = "write"
+				}
+				rf.MemoryOps = append(rf.MemoryOps, MemoryOp{Type: opType, Path: c.Input.FilePath})
+			}
 		}
 	}
 	return rf
@@ -229,4 +255,40 @@ func extractMessageCount(request string) int {
 		return 0
 	}
 	return len(req.Messages)
+}
+
+// extractSystemPromptSize returns the byte length of the raw system field.
+func extractSystemPromptSize(request string) int {
+	var req struct {
+		System json.RawMessage `json:"system"`
+	}
+	if json.Unmarshal([]byte(request), &req) != nil || req.System == nil {
+		return 0
+	}
+	return len(req.System)
+}
+
+var memoryPathRe = regexp.MustCompile(`\.claude/[\w/._-]+`)
+
+// extractMemoryFiles scans the system prompt for .claude/ path references.
+func extractMemoryFiles(request string) []string {
+	var req struct {
+		System []struct {
+			Text string `json:"text"`
+		} `json:"system"`
+	}
+	if json.Unmarshal([]byte(request), &req) != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var files []string
+	for _, block := range req.System {
+		for _, match := range memoryPathRe.FindAllString(block.Text, -1) {
+			if !seen[match] {
+				seen[match] = true
+				files = append(files, match)
+			}
+		}
+	}
+	return files
 }

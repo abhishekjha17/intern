@@ -8,6 +8,12 @@ type BlockInfo struct {
 	Name string `json:"name,omitempty"`
 }
 
+// MemoryOp represents a read or write operation on a memory file.
+type MemoryOp struct {
+	Type string `json:"type"` // "read" or "write"
+	Path string `json:"path"`
+}
+
 // MessageProfile is the enriched per-message profiling record.
 type MessageProfile struct {
 	Index     int       `json:"index"`
@@ -32,6 +38,13 @@ type MessageProfile struct {
 	MaxTokens       int      `json:"max_tokens"`
 	BashCommands    []string `json:"bash_commands,omitempty"`
 
+	// Context & memory
+	MessageCount      int        `json:"message_count"`
+	SystemPromptSize  int        `json:"system_prompt_size_bytes"`
+	MemoryFilesLoaded []string   `json:"memory_files_loaded,omitempty"`
+	MemoryOperations  []MemoryOp `json:"memory_operations,omitempty"`
+	IsCompactionEvent bool       `json:"is_compaction_event,omitempty"`
+
 	// Classification
 	Phase              string `json:"phase"`
 	Complexity         string `json:"complexity"`
@@ -55,6 +68,8 @@ type ProfileReport struct {
 	Phases     []CategoryCount     `json:"phases"`
 	Complexity []CategoryCount     `json:"complexity"`
 	Offload    OffloadAnalysis     `json:"offload"`
+	Context    ContextAnalysis     `json:"context"`
+	Memory     MemoryAnalysis      `json:"memory"`
 }
 
 // ModelCost holds cost breakdown for a single model.
@@ -151,7 +166,34 @@ type CategoryCount struct {
 
 // OffloadAnalysis summarizes offload candidate statistics.
 type OffloadAnalysis struct {
-	TotalCandidates  int                  `json:"total_candidates"`
-	PotentialSavings float64              `json:"potential_savings"`
-	ByReason         []CategoryCount      `json:"by_reason"`
+	TotalCandidates  int             `json:"total_candidates"`
+	PotentialSavings float64         `json:"potential_savings"`
+	ByReason         []CategoryCount `json:"by_reason"`
+}
+
+// ContextAnalysis summarizes chat history and context window patterns.
+type ContextAnalysis struct {
+	AvgMessageCount     float64 `json:"avg_message_count"`
+	MaxMessageCount     int     `json:"max_message_count"`
+	AvgSystemPromptSize int     `json:"avg_system_prompt_size_bytes"`
+	CompactionEvents    int     `json:"compaction_events"`
+	ContextGrowthRate   float64 `json:"avg_context_growth_per_turn"`
+}
+
+// MemoryAnalysis summarizes memory file recall and write patterns.
+type MemoryAnalysis struct {
+	TotalRecalls         int               `json:"total_recalls"`
+	TotalWrites          int               `json:"total_writes"`
+	UniqueFilesAccessed  int               `json:"unique_files_accessed"`
+	FileAccessCounts     []FileAccessCount `json:"file_access_counts"`
+	AvgMemoryFilesLoaded float64           `json:"avg_memory_files_loaded"`
+	MaxMemoryFilesLoaded int               `json:"max_memory_files_loaded"`
+}
+
+// FileAccessCount holds read/write counts for a single memory file.
+type FileAccessCount struct {
+	Path       string  `json:"path"`
+	Reads      int     `json:"reads"`
+	Writes     int     `json:"writes"`
+	Percentage float64 `json:"percentage"`
 }
