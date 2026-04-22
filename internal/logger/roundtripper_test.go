@@ -221,6 +221,64 @@ data: {"type":"message_stop"}
 	}
 }
 
+func TestUsageFromSSE_CacheCreationBreakdown(t *testing.T) {
+	// Explicit 5m / 1h cache TTLs: the nested cache_creation object takes
+	// precedence over the top-level cache_creation_input_tokens sum.
+	body := `event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":7000,"cache_creation":{"ephemeral_5m_input_tokens":5000,"ephemeral_1h_input_tokens":2000}}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50}}
+`
+	usage, _ := UsageFromSSE(body)
+	if usage.CacheCreation == nil {
+		t.Fatal("CacheCreation breakdown not captured")
+	}
+	if usage.CacheCreation.Ephemeral5mInputTokens != 5000 {
+		t.Errorf("5m = %d, want 5000", usage.CacheCreation.Ephemeral5mInputTokens)
+	}
+	if usage.CacheCreation.Ephemeral1hInputTokens != 2000 {
+		t.Errorf("1h = %d, want 2000", usage.CacheCreation.Ephemeral1hInputTokens)
+	}
+
+	fiveMin, oneHour := cacheCreationTokens(usage)
+	if fiveMin != 5000 || oneHour != 2000 {
+		t.Errorf("cacheCreationTokens = (%d, %d), want (5000, 2000)", fiveMin, oneHour)
+	}
+}
+
+func TestUsageFromSSE_ServerToolUse(t *testing.T) {
+	// server_tool_use counts may appear in both message_start (initial) and
+	// message_delta (final). The delta value wins.
+	body := `event: message_start
+data: {"type":"message_start","message":{"model":"claude-opus-4-7","usage":{"input_tokens":100,"output_tokens":10,"server_tool_use":{"web_search_requests":1,"code_execution_requests":0}}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":50,"server_tool_use":{"web_search_requests":3,"code_execution_requests":2}}}
+`
+	usage, _ := UsageFromSSE(body)
+	if usage.ServerToolUse == nil {
+		t.Fatal("ServerToolUse not captured")
+	}
+	if usage.ServerToolUse.WebSearchRequests != 3 {
+		t.Errorf("web_search = %d, want 3", usage.ServerToolUse.WebSearchRequests)
+	}
+	if usage.ServerToolUse.CodeExecutionRequests != 2 {
+		t.Errorf("code_exec = %d, want 2", usage.ServerToolUse.CodeExecutionRequests)
+	}
+}
+
+func TestCacheCreationTokens_SumOnlyFallback(t *testing.T) {
+	// No explicit breakdown → attribute the whole sum to the 5m bucket,
+	// since that's Anthropic's default TTL when cache_control is set without
+	// an explicit ttl field.
+	u := AnthropicUsage{CacheCreationInputTokens: 1234}
+	fiveMin, oneHour := cacheCreationTokens(u)
+	if fiveMin != 1234 || oneHour != 0 {
+		t.Errorf("got (%d, %d), want (1234, 0)", fiveMin, oneHour)
+	}
+}
+
 func TestUsageFromSSE_MixedThinkingTextToolUse(t *testing.T) {
 	// Realistic response with thinking + text + tool_use blocks.
 	body := `event: message_start

@@ -90,8 +90,31 @@ func Analyze(traces []logger.Trace, files []string) *ProfileReport {
 		rf := ExtractResponse(t.Response)
 		toolsCalled := extractToolsCalled(rf.Blocks)
 		maxTokens := extractMaxTokens(t.Request)
+		geo := t.InferenceGeo
+		if geo == "" {
+			geo = extractInferenceGeo(t.Request)
+		}
 
-		cost := CostForTokens(t.Model, t.InputTokens, t.OutputTokens, t.CacheReadTokens, rf.CacheCreation)
+		// Persisted trace fields take precedence over response re-parsing so that
+		// newer trace files honor the exact usage Anthropic reported even if the
+		// response body is later truncated or redacted.
+		cacheCreate5m := rf.CacheCreation5m
+		cacheCreate1h := rf.CacheCreation1h
+		if t.CacheCreation5mTokens > 0 || t.CacheCreation1hTokens > 0 {
+			cacheCreate5m = t.CacheCreation5mTokens
+			cacheCreate1h = t.CacheCreation1hTokens
+		}
+		webSearch := rf.WebSearchRequests
+		if t.WebSearchRequests > 0 {
+			webSearch = t.WebSearchRequests
+		}
+		codeExec := rf.CodeExecutionRequests
+		if t.CodeExecutionRequests > 0 {
+			codeExec = t.CodeExecutionRequests
+		}
+
+		breakdown := ComputeCost(t.Model, t.InputTokens, t.OutputTokens, t.CacheReadTokens, cacheCreate5m, cacheCreate1h, webSearch, geo)
+		cost := breakdown.Total
 
 		// Build per-message profile
 		blockTypes := make([]string, len(rf.Blocks))
@@ -100,28 +123,34 @@ func Analyze(traces []logger.Trace, files []string) *ProfileReport {
 		}
 
 		msg := MessageProfile{
-			Index:               i,
-			Timestamp:           t.Timestamp,
-			SessionID:           t.SessionID,
-			Model:               t.Model,
-			InputTokens:         t.InputTokens,
-			OutputTokens:        t.OutputTokens,
-			CacheReadTokens:     t.CacheReadTokens,
-			CacheCreationTokens: rf.CacheCreation,
-			ThinkingTokens:      t.ThinkingTokens,
-			Cost:                cost,
-			OutputType:          classifyOutputType(rf.Blocks),
-			ToolsCalled:         toolsCalled,
-			ContentBlocks:       blockTypes,
-			HasThinking:         rf.HasThinkingBlock,
-			HasThinkingText:     rf.HasThinkingText,
-			MaxTokens:           maxTokens,
-			BashCommands:        rf.BashCommands,
-			HasToolResult:       extractHasToolResult(t.Request),
-			MessageCount:        extractMessageCount(t.Request),
-			SystemPromptSize:    extractSystemPromptSize(t.Request),
-			MemoryFilesLoaded:   extractMemoryFiles(t.Request),
-			MemoryOperations:    rf.MemoryOps,
+			Index:                 i,
+			Timestamp:             t.Timestamp,
+			SessionID:             t.SessionID,
+			Model:                 t.Model,
+			InputTokens:           t.InputTokens,
+			OutputTokens:          t.OutputTokens,
+			CacheReadTokens:       t.CacheReadTokens,
+			CacheCreationTokens:   cacheCreate5m + cacheCreate1h,
+			CacheCreation5mTokens: cacheCreate5m,
+			CacheCreation1hTokens: cacheCreate1h,
+			ThinkingTokens:        t.ThinkingTokens,
+			Cost:                  cost,
+			WebSearchRequests:     webSearch,
+			CodeExecutionRequests: codeExec,
+			InferenceGeo:          geo,
+			WebSearchCost:         breakdown.WebSearch,
+			OutputType:            classifyOutputType(rf.Blocks),
+			ToolsCalled:           toolsCalled,
+			ContentBlocks:         blockTypes,
+			HasThinking:           rf.HasThinkingBlock,
+			HasThinkingText:       rf.HasThinkingText,
+			MaxTokens:             maxTokens,
+			BashCommands:          rf.BashCommands,
+			HasToolResult:         extractHasToolResult(t.Request),
+			MessageCount:          extractMessageCount(t.Request),
+			SystemPromptSize:      extractSystemPromptSize(t.Request),
+			MemoryFilesLoaded:     extractMemoryFiles(t.Request),
+			MemoryOperations:      rf.MemoryOps,
 		}
 
 		// Classify
@@ -144,8 +173,28 @@ func Analyze(traces []logger.Trace, files []string) *ProfileReport {
 		mc.InputTokens += t.InputTokens
 		mc.OutputTokens += t.OutputTokens
 		mc.CacheReadTokens += t.CacheReadTokens
-		mc.CacheCreationTokens += rf.CacheCreation
-		mc.TotalCost += cost
+		mc.CacheCreation5mTokens += cacheCreate5m
+		mc.CacheCreation1hTokens += cacheCreate1h
+		mc.CacheCreationTokens += cacheCreate5m + cacheCreate1h
+		mc.WebSearchRequests += webSearch
+		mc.CodeExecutionRequests += codeExec
+		mc.InputCost += breakdown.Input
+		mc.OutputCost += breakdown.Output
+		mc.CacheReadCost += breakdown.CacheRead
+		mc.CacheCreation5mCost += breakdown.CacheWrite5m
+		mc.CacheCreation1hCost += breakdown.CacheWrite1h
+		mc.CacheCreationCost += breakdown.CacheWrite5m + breakdown.CacheWrite1h
+		mc.WebSearchCost += breakdown.WebSearch
+		mc.DataResidencyAdjustment += breakdown.DataResidencyAdjust
+		mc.TotalCost += breakdown.Total
+
+		if breakdown.DataResidencyAdjust > 0 {
+			report.Cost.DataResidencyMessages++
+			report.Cost.DataResidencyAdjustment += breakdown.DataResidencyAdjust
+		}
+		report.Cost.WebSearchRequestsTotal += webSearch
+		report.Cost.CodeExecutionRequestsTotal += codeExec
+		report.Cost.WebSearchCostTotal += breakdown.WebSearch
 
 		// Tokens by model
 		mt, ok := modelTokens[t.Model]
@@ -256,11 +305,6 @@ func Analyze(traces []logger.Trace, files []string) *ProfileReport {
 		report.Cost.AvgPerMsg = totalCost / float64(len(traces))
 	}
 	for _, mc := range modelCosts {
-		p := Pricing[mc.Model]
-		mc.InputCost = float64(mc.InputTokens) / 1_000_000 * p.Input
-		mc.OutputCost = float64(mc.OutputTokens) / 1_000_000 * p.Output
-		mc.CacheReadCost = float64(mc.CacheReadTokens) / 1_000_000 * p.CacheRead
-		mc.CacheCreationCost = float64(mc.CacheCreationTokens) / 1_000_000 * p.CacheCreate
 		if mc.Messages > 0 {
 			mc.AvgCostPerMessage = mc.TotalCost / float64(mc.Messages)
 		}

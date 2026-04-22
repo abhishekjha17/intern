@@ -15,6 +15,8 @@ import (
 )
 
 // Trace is the schema written as a single JSON line to the trace file.
+// New pricing-relevant fields are additive and tagged with omitempty so
+// older trace files still parse cleanly.
 type Trace struct {
 	Timestamp       time.Time `json:"timestamp"`
 	SessionID       string    `json:"session_id"`
@@ -25,29 +27,73 @@ type Trace struct {
 	OutputTokens    int       `json:"output_tokens"`
 	ThinkingTokens  int       `json:"thinking_tokens"`
 	CacheReadTokens int       `json:"cache_read_tokens"`
+
+	// CacheCreation{5m,1h}Tokens split the `cache_creation` usage breakdown
+	// Anthropic returns when explicit cache TTLs are requested. When the API
+	// returns only a top-level `cache_creation_input_tokens` sum, we treat it
+	// as 5-minute writes (Anthropic's default cache TTL).
+	CacheCreation5mTokens int `json:"cache_creation_5m_tokens,omitempty"`
+	CacheCreation1hTokens int `json:"cache_creation_1h_tokens,omitempty"`
+
+	// Server-side tool usage counts for features that carry separate surcharges
+	// beyond token pricing.
+	WebSearchRequests     int `json:"web_search_requests,omitempty"`
+	CodeExecutionRequests int `json:"code_execution_requests,omitempty"`
+
+	// InferenceGeo mirrors the request's inference_geo field. "us-only" maps
+	// to the 1.1x data-residency multiplier; any other value (including empty)
+	// uses standard pricing.
+	InferenceGeo string `json:"inference_geo,omitempty"`
 }
 
 // logEntry is the value sent over the buffered channel to the background worker.
 type logEntry struct {
-	timestamp   time.Time
-	sessionID   string
-	model       string
-	request     string
-	response    string
-	contentType string
+	timestamp    time.Time
+	sessionID    string
+	model        string
+	request      string
+	response     string
+	contentType  string
+	inferenceGeo string
 }
 
 // AnthropicUsage mirrors the usage object returned by the Anthropic API.
 type AnthropicUsage struct {
-	InputTokens               int `json:"input_tokens"`
-	OutputTokens              int `json:"output_tokens"`
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 	// ThinkingTokens is populated when the API explicitly breaks out thinking
 	// token usage (possible in future API versions). Currently, thinking tokens
 	// are bundled into OutputTokens by Anthropic, so this field will typically
 	// be zero and ThinkingTokensFromContent is used instead.
-	ThinkingTokens            int `json:"thinking_tokens"`
-	CacheReadInputTokens      int `json:"cache_read_input_tokens"`
-	CacheCreationInputTokens  int `json:"cache_creation_input_tokens"`
+	ThinkingTokens           int                 `json:"thinking_tokens"`
+	CacheReadInputTokens     int                 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int                 `json:"cache_creation_input_tokens"`
+	CacheCreation            *CacheCreationBreak `json:"cache_creation,omitempty"`
+	ServerToolUse            *ServerToolUseUsage `json:"server_tool_use,omitempty"`
+}
+
+// CacheCreationBreak is the per-TTL breakdown Anthropic returns inside the
+// usage object when explicit cache control tiers are used.
+type CacheCreationBreak struct {
+	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens"`
+	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens"`
+}
+
+// ServerToolUseUsage counts server-side tool invocations that Anthropic meters
+// separately from token usage (web search, code execution, etc.).
+type ServerToolUseUsage struct {
+	WebSearchRequests     int `json:"web_search_requests"`
+	CodeExecutionRequests int `json:"code_execution_requests"`
+}
+
+// cacheCreationTokens returns the (5m, 1h) token counts from usage, preferring
+// the explicit `cache_creation` sub-object and falling back to attributing the
+// top-level `cache_creation_input_tokens` sum to the 5-minute bucket.
+func cacheCreationTokens(u AnthropicUsage) (fiveMin, oneHour int) {
+	if u.CacheCreation != nil {
+		return u.CacheCreation.Ephemeral5mInputTokens, u.CacheCreation.Ephemeral1hInputTokens
+	}
+	return u.CacheCreationInputTokens, 0
 }
 
 // AnthropicContentBlock represents a single block in the response content array.
@@ -106,10 +152,15 @@ type SSEContentBlockDelta struct {
 // by scanning message_start, content_block_start, content_block_delta, and
 // message_delta events. Thinking text is accumulated from thinking_delta events
 // since message_start always carries an empty content array in streaming responses.
+//
+// Usage fields are merged across events: message_start carries input/cache
+// totals; message_delta carries final output_tokens and — when server-side
+// tools are used — server_tool_use counts.
 func UsageFromSSE(body string) (usage AnthropicUsage, content []AnthropicContentBlock) {
 	var thinkingBuf strings.Builder
 
 	scanner := bufio.NewScanner(strings.NewReader(body))
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -117,12 +168,19 @@ func UsageFromSSE(body string) (usage AnthropicUsage, content []AnthropicContent
 		}
 		data := strings.TrimPrefix(line, "data: ")
 
-		// Try message_start — carries initial usage.
+		// Try message_start — carries initial usage (input, cache, per-TTL breakdown).
 		var ms SSEMessageStart
 		if json.Unmarshal([]byte(data), &ms) == nil && ms.Type == "message_start" {
-			usage.InputTokens = ms.Message.Usage.InputTokens
-			usage.CacheReadInputTokens = ms.Message.Usage.CacheReadInputTokens
-			usage.CacheCreationInputTokens = ms.Message.Usage.CacheCreationInputTokens
+			u := ms.Message.Usage
+			usage.InputTokens = u.InputTokens
+			usage.CacheReadInputTokens = u.CacheReadInputTokens
+			usage.CacheCreationInputTokens = u.CacheCreationInputTokens
+			if u.CacheCreation != nil {
+				usage.CacheCreation = u.CacheCreation
+			}
+			if u.ServerToolUse != nil {
+				usage.ServerToolUse = u.ServerToolUse
+			}
 		}
 
 		// Try content_block_delta — accumulate thinking text from thinking_delta events.
@@ -131,10 +189,17 @@ func UsageFromSSE(body string) (usage AnthropicUsage, content []AnthropicContent
 			thinkingBuf.WriteString(cbd.Delta.Thinking)
 		}
 
-		// Try message_delta — carries final output token count.
+		// Try message_delta — carries final output token count and may update
+		// server_tool_use counts when tools are invoked mid-stream.
 		var md SSEMessageDelta
 		if json.Unmarshal([]byte(data), &md) == nil && md.Type == "message_delta" {
 			usage.OutputTokens = md.Usage.OutputTokens
+			if md.Usage.ServerToolUse != nil {
+				usage.ServerToolUse = md.Usage.ServerToolUse
+			}
+			if md.Usage.CacheCreation != nil && usage.CacheCreation == nil {
+				usage.CacheCreation = md.Usage.CacheCreation
+			}
 		}
 	}
 
@@ -152,8 +217,9 @@ func UsageFromSSE(body string) (usage AnthropicUsage, content []AnthropicContent
 
 // anthropicRequest captures only the fields we need from the outgoing request body.
 type anthropicRequest struct {
-	Model    string            `json:"model"`
-	Messages []json.RawMessage `json:"messages"`
+	Model        string            `json:"model"`
+	Messages     []json.RawMessage `json:"messages"`
+	InferenceGeo string            `json:"inference_geo,omitempty"`
 }
 
 // sessionID derives a stable 16-char hex session identifier by hashing the raw
@@ -261,12 +327,13 @@ func (l *LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		return resp, err
 	}
 
-	// Extract model and session ID from the request JSON (best-effort).
-	var model, sid string
+	// Extract model, session ID, and inference_geo from the request JSON (best-effort).
+	var model, sid, geo string
 	var ar anthropicRequest
 	if json.Unmarshal(reqBody, &ar) == nil {
 		model = ar.Model
 		sid = sessionID(ar.Messages)
+		geo = ar.InferenceGeo
 	}
 
 	// Wrap the response body so we capture it as the caller streams through it.
@@ -274,11 +341,12 @@ func (l *LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		orig: resp.Body,
 		ch:   l.ch,
 		meta: logEntry{
-			timestamp:   ts,
-			sessionID:   sid,
-			model:       model,
-			request:     string(reqBody),
-			contentType: resp.Header.Get("Content-Type"),
+			timestamp:    ts,
+			sessionID:    sid,
+			model:        model,
+			request:      string(reqBody),
+			contentType:  resp.Header.Get("Content-Type"),
+			inferenceGeo: geo,
 		},
 	}
 
@@ -330,16 +398,28 @@ func (l *LoggingRoundTripper) worker() {
 			thinkingTokens = ThinkingTokensFromContent(content)
 		}
 
+		fiveMin, oneHour := cacheCreationTokens(usage)
+		var webSearch, codeExec int
+		if usage.ServerToolUse != nil {
+			webSearch = usage.ServerToolUse.WebSearchRequests
+			codeExec = usage.ServerToolUse.CodeExecutionRequests
+		}
+
 		trace := Trace{
-			Timestamp:       entry.timestamp,
-			SessionID:       entry.sessionID,
-			Model:           entry.model,
-			Request:         entry.request,
-			Response:        entry.response,
-			InputTokens:     usage.InputTokens,
-			OutputTokens:    usage.OutputTokens,
-			ThinkingTokens:  thinkingTokens,
-			CacheReadTokens: usage.CacheReadInputTokens,
+			Timestamp:             entry.timestamp,
+			SessionID:             entry.sessionID,
+			Model:                 entry.model,
+			Request:               entry.request,
+			Response:              entry.response,
+			InputTokens:           usage.InputTokens,
+			OutputTokens:          usage.OutputTokens,
+			ThinkingTokens:        thinkingTokens,
+			CacheReadTokens:       usage.CacheReadInputTokens,
+			CacheCreation5mTokens: fiveMin,
+			CacheCreation1hTokens: oneHour,
+			WebSearchRequests:     webSearch,
+			CodeExecutionRequests: codeExec,
+			InferenceGeo:          entry.inferenceGeo,
 		}
 
 		if err := enc.Encode(trace); err != nil {

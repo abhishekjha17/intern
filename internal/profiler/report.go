@@ -26,17 +26,35 @@ func RenderText(w io.Writer, r *ProfileReport) {
 func renderCost(w io.Writer, r *ProfileReport) {
 	fmt.Fprintf(w, "=== Cost Report ===\n\n")
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(tw, "MODEL\tMSGS\tINPUT\tOUTPUT\tCACHE READ\tCACHE CREATE\tTOTAL\tAVG/MSG\n")
-	fmt.Fprintf(tw, "-----\t----\t-----\t------\t----------\t------------\t-----\t-------\n")
+	fmt.Fprintf(tw, "MODEL\tMSGS\tINPUT\tOUTPUT\tCACHE READ\tCACHE 5m\tCACHE 1h\tTOTAL\tAVG/MSG\n")
+	fmt.Fprintf(tw, "-----\t----\t-----\t------\t----------\t--------\t--------\t-----\t-------\n")
 	for _, mc := range r.Cost.ByModel {
-		fmt.Fprintf(tw, "%s\t%d\t$%.4f\t$%.4f\t$%.4f\t$%.4f\t$%.4f\t$%.4f\n",
+		fmt.Fprintf(tw, "%s\t%d\t$%.4f\t$%.4f\t$%.4f\t$%.4f\t$%.4f\t$%.4f\t$%.4f\n",
 			mc.Model, mc.Messages,
-			mc.InputCost, mc.OutputCost, mc.CacheReadCost, mc.CacheCreationCost,
+			mc.InputCost, mc.OutputCost, mc.CacheReadCost,
+			mc.CacheCreation5mCost, mc.CacheCreation1hCost,
 			mc.TotalCost, mc.AvgCostPerMessage)
 	}
 	tw.Flush()
-	fmt.Fprintf(w, "\nGrand Total: $%.4f  |  Avg per Message: $%.4f  |  Messages: %d\n\n",
+	fmt.Fprintf(w, "\nGrand Total: $%.4f  |  Avg per Message: $%.4f  |  Messages: %d\n",
 		r.Cost.GrandTotal, r.Cost.AvgPerMsg, len(r.Messages))
+
+	if r.Cost.WebSearchRequestsTotal > 0 || r.Cost.CodeExecutionRequestsTotal > 0 {
+		fmt.Fprintf(w, "\nServer-side tools:\n")
+		if r.Cost.WebSearchRequestsTotal > 0 {
+			fmt.Fprintf(w, "  Web search:     %d requests → $%.4f (billed $10 per 1,000)\n",
+				r.Cost.WebSearchRequestsTotal, r.Cost.WebSearchCostTotal)
+		}
+		if r.Cost.CodeExecutionRequestsTotal > 0 {
+			fmt.Fprintf(w, "  Code execution: %d requests (container-hour billing not estimated from traces)\n",
+				r.Cost.CodeExecutionRequestsTotal)
+		}
+	}
+	if r.Cost.DataResidencyMessages > 0 {
+		fmt.Fprintf(w, "\nData residency (us-only): %d messages at 1.1x multiplier → +$%.4f\n",
+			r.Cost.DataResidencyMessages, r.Cost.DataResidencyAdjustment)
+	}
+	fmt.Fprintln(w)
 }
 
 func renderTokens(w io.Writer, r *ProfileReport) {
