@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.2](https://github.com/abhishekjha17/intern/compare/v0.1.1...v0.1.2) (2026-04-22)
+
+
+### Features
+
+* add memory recall and chat history profiling ([9daff65](https://github.com/abhishekjha17/intern/commit/9daff6590e29c2a9b1dfa374ddbd59c77f90be83))
+* add memory recall and chat history profiling ([8bf0d4c](https://github.com/abhishekjha17/intern/commit/8bf0d4c9bc4216d7b926b89e5b583c623bdfdd6a)), closes [#3](https://github.com/abhishekjha17/intern/issues/3)
+* **pricing:** external config, per-TTL cache rates, server-tool surcharge, data residency ([be95a63](https://github.com/abhishekjha17/intern/commit/be95a63b849384603ed5593f565b1408b1c4ffe0))
+* **pricing:** external config, per-TTL cache rates, server-tool surcharge, data residency ([02a8eb9](https://github.com/abhishekjha17/intern/commit/02a8eb90c729921f84fd324007d8a6a6dbd8023c))
+
 ## [0.1.1](https://github.com/abhishekjha17/intern/compare/v0.1.0...v0.1.1) (2026-04-17)
 
 
