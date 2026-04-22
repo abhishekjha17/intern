@@ -142,6 +142,7 @@ func runProxy(args []string) int {
 func runProfile(args []string) int {
 	fs := flag.NewFlagSet("profile", flag.ExitOnError)
 	jsonOutput := fs.Bool("json", false, "output as JSON")
+	pricingPath := fs.String("pricing", "", "path to a JSON pricing override file (defaults to $XDG_CONFIG_HOME/intern/pricing.json if present)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: intern profile [flags] <trace-files...>\n\nFlags:\n")
 		fs.PrintDefaults()
@@ -152,6 +153,13 @@ func runProfile(args []string) int {
 	if len(files) == 0 {
 		fs.Usage()
 		return 1
+	}
+
+	if source, err := profiler.LoadPricing(*pricingPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error loading pricing: %v\n", err)
+		return 1
+	} else if source != "embedded" {
+		fmt.Fprintf(os.Stderr, "pricing: loaded overrides from %s\n", source)
 	}
 
 	traces, err := profiler.LoadTraces(files)

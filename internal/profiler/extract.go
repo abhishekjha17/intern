@@ -12,9 +12,21 @@ type ResponseFields struct {
 	Blocks           []BlockInfo
 	HasThinkingBlock bool
 	HasThinkingText  bool
-	CacheCreation    int
-	BashCommands     []string
-	MemoryOps        []MemoryOp
+
+	// CacheCreation is the total (5m + 1h) for legacy callers.
+	// CacheCreation5m / CacheCreation1h split the total when the API provides
+	// a per-TTL breakdown; when only the top-level sum is available the whole
+	// amount is attributed to the 5-minute bucket (Anthropic's default cache TTL).
+	CacheCreation   int
+	CacheCreation5m int
+	CacheCreation1h int
+
+	// Server-side tool invocation counts (metered separately from tokens).
+	WebSearchRequests     int
+	CodeExecutionRequests int
+
+	BashCommands []string
+	MemoryOps    []MemoryOp
 }
 
 // ExtractResponse parses a raw response (SSE or JSON) in a single pass,
@@ -36,7 +48,45 @@ func extractResponseSSE(response string) ResponseFields {
 	}
 	toolBlocks := map[int]*toolBlock{}
 
+	type usageShape struct {
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheCreation            *struct {
+			Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens"`
+			Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens"`
+		} `json:"cache_creation,omitempty"`
+		ServerToolUse *struct {
+			WebSearchRequests     int `json:"web_search_requests"`
+			CodeExecutionRequests int `json:"code_execution_requests"`
+		} `json:"server_tool_use,omitempty"`
+	}
+
+	// cacheCreationSeen tracks whether any earlier event already reported a
+	// cache_creation breakdown; once set we don't let a later message_delta
+	// overwrite the initial message_start values. This mirrors the
+	// roundtripper's first-writer-wins policy so the persisted trace and the
+	// re-parsed response agree on cache token attribution.
+	var cacheCreationSeen bool
+	applyUsage := func(u usageShape, allowCacheOverwrite bool) {
+		if allowCacheOverwrite || !cacheCreationSeen {
+			if u.CacheCreation != nil {
+				rf.CacheCreation5m = u.CacheCreation.Ephemeral5mInputTokens
+				rf.CacheCreation1h = u.CacheCreation.Ephemeral1hInputTokens
+				rf.CacheCreation = rf.CacheCreation5m + rf.CacheCreation1h
+				cacheCreationSeen = true
+			} else if u.CacheCreationInputTokens > 0 {
+				rf.CacheCreation = u.CacheCreationInputTokens
+				rf.CacheCreation5m = u.CacheCreationInputTokens
+				cacheCreationSeen = true
+			}
+		}
+		if u.ServerToolUse != nil {
+			rf.WebSearchRequests = u.ServerToolUse.WebSearchRequests
+			rf.CodeExecutionRequests = u.ServerToolUse.CodeExecutionRequests
+		}
+	}
+
 	scanner := bufio.NewScanner(strings.NewReader(response))
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -56,10 +106,9 @@ func extractResponseSSE(response string) ResponseFields {
 				PartialJSON string `json:"partial_json"`
 			} `json:"delta"`
 			Message struct {
-				Usage struct {
-					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-				} `json:"usage"`
+				Usage usageShape `json:"usage"`
 			} `json:"message"`
+			Usage usageShape `json:"usage"`
 		}
 		if json.Unmarshal([]byte(data), &evt) != nil {
 			continue
@@ -67,7 +116,11 @@ func extractResponseSSE(response string) ResponseFields {
 
 		switch evt.Type {
 		case "message_start":
-			rf.CacheCreation = evt.Message.Usage.CacheCreationInputTokens
+			applyUsage(evt.Message.Usage, true)
+		case "message_delta":
+			// server_tool_use counts always update; cache_creation only fills in
+			// when message_start didn't already provide a breakdown.
+			applyUsage(evt.Usage, false)
 
 		case "content_block_start":
 			rf.Blocks = append(rf.Blocks, BlockInfo{
@@ -131,13 +184,32 @@ func extractResponseJSON(response string) ResponseFields {
 		} `json:"content"`
 		Usage struct {
 			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			CacheCreation            *struct {
+				Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens"`
+				Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens"`
+			} `json:"cache_creation,omitempty"`
+			ServerToolUse *struct {
+				WebSearchRequests     int `json:"web_search_requests"`
+				CodeExecutionRequests int `json:"code_execution_requests"`
+			} `json:"server_tool_use,omitempty"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(response), &resp) != nil {
 		return rf
 	}
 
-	rf.CacheCreation = resp.Usage.CacheCreationInputTokens
+	if resp.Usage.CacheCreation != nil {
+		rf.CacheCreation5m = resp.Usage.CacheCreation.Ephemeral5mInputTokens
+		rf.CacheCreation1h = resp.Usage.CacheCreation.Ephemeral1hInputTokens
+		rf.CacheCreation = rf.CacheCreation5m + rf.CacheCreation1h
+	} else {
+		rf.CacheCreation = resp.Usage.CacheCreationInputTokens
+		rf.CacheCreation5m = resp.Usage.CacheCreationInputTokens
+	}
+	if resp.Usage.ServerToolUse != nil {
+		rf.WebSearchRequests = resp.Usage.ServerToolUse.WebSearchRequests
+		rf.CodeExecutionRequests = resp.Usage.ServerToolUse.CodeExecutionRequests
+	}
 	rf.Blocks = make([]BlockInfo, len(resp.Content))
 	for i, c := range resp.Content {
 		rf.Blocks[i] = BlockInfo{Type: c.Type, Name: c.Name}
@@ -266,6 +338,19 @@ func extractSystemPromptSize(request string) int {
 		return 0
 	}
 	return len(req.System)
+}
+
+// extractInferenceGeo returns the value of the request's inference_geo field,
+// or the empty string when absent. "us-only" triggers the 1.1x data-residency
+// multiplier; any other value uses standard pricing.
+func extractInferenceGeo(request string) string {
+	var req struct {
+		InferenceGeo string `json:"inference_geo"`
+	}
+	if json.Unmarshal([]byte(request), &req) != nil {
+		return ""
+	}
+	return req.InferenceGeo
 }
 
 var memoryPathRe = regexp.MustCompile(`\.claude/[\w/._-]+`)

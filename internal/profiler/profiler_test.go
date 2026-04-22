@@ -3,6 +3,8 @@ package profiler
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -141,6 +143,76 @@ func TestExtractResponse_JSON_CacheCreation(t *testing.T) {
 	rf := ExtractResponse(resp)
 	if rf.CacheCreation != 3000 {
 		t.Errorf("got %d, want 3000", rf.CacheCreation)
+	}
+	// Sum-only responses attribute all cache creation to the 5-minute bucket.
+	if rf.CacheCreation5m != 3000 || rf.CacheCreation1h != 0 {
+		t.Errorf("got 5m=%d 1h=%d, want 3000/0", rf.CacheCreation5m, rf.CacheCreation1h)
+	}
+}
+
+func TestExtractResponse_SSE_CacheCreationBreakdown(t *testing.T) {
+	sse := lines(
+		"event: message_start",
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":7000,"cache_creation":{"ephemeral_5m_input_tokens":5000,"ephemeral_1h_input_tokens":2000}}}}`,
+	)
+	rf := ExtractResponse(sse)
+	if rf.CacheCreation5m != 5000 {
+		t.Errorf("5m got %d, want 5000", rf.CacheCreation5m)
+	}
+	if rf.CacheCreation1h != 2000 {
+		t.Errorf("1h got %d, want 2000", rf.CacheCreation1h)
+	}
+	if rf.CacheCreation != 7000 {
+		t.Errorf("sum got %d, want 7000", rf.CacheCreation)
+	}
+}
+
+func TestExtractResponse_JSON_CacheCreationBreakdown(t *testing.T) {
+	resp := `{"usage":{"input_tokens":50,"cache_creation_input_tokens":7000,"cache_creation":{"ephemeral_5m_input_tokens":4000,"ephemeral_1h_input_tokens":3000}}}`
+	rf := ExtractResponse(resp)
+	if rf.CacheCreation5m != 4000 || rf.CacheCreation1h != 3000 || rf.CacheCreation != 7000 {
+		t.Errorf("got 5m=%d 1h=%d sum=%d, want 4000/3000/7000",
+			rf.CacheCreation5m, rf.CacheCreation1h, rf.CacheCreation)
+	}
+}
+
+func TestExtractResponse_SSE_ServerToolUse(t *testing.T) {
+	sse := lines(
+		"event: message_start",
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":100,"server_tool_use":{"web_search_requests":3,"code_execution_requests":1}}}}`,
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":200,"server_tool_use":{"web_search_requests":5,"code_execution_requests":2}}}`,
+	)
+	rf := ExtractResponse(sse)
+	// message_delta count wins since it arrives last.
+	if rf.WebSearchRequests != 5 {
+		t.Errorf("WebSearchRequests = %d, want 5", rf.WebSearchRequests)
+	}
+	if rf.CodeExecutionRequests != 2 {
+		t.Errorf("CodeExecutionRequests = %d, want 2", rf.CodeExecutionRequests)
+	}
+}
+
+func TestExtractResponse_JSON_ServerToolUse(t *testing.T) {
+	resp := `{"usage":{"input_tokens":100,"output_tokens":50,"server_tool_use":{"web_search_requests":2,"code_execution_requests":0}}}`
+	rf := ExtractResponse(resp)
+	if rf.WebSearchRequests != 2 {
+		t.Errorf("WebSearchRequests = %d, want 2", rf.WebSearchRequests)
+	}
+	if rf.CodeExecutionRequests != 0 {
+		t.Errorf("CodeExecutionRequests = %d, want 0", rf.CodeExecutionRequests)
+	}
+}
+
+func TestExtractInferenceGeo(t *testing.T) {
+	if got := extractInferenceGeo(`{"model":"claude-opus-4-7","inference_geo":"us-only","messages":[]}`); got != "us-only" {
+		t.Errorf("got %q, want us-only", got)
+	}
+	if got := extractInferenceGeo(`{"model":"claude-opus-4-7","messages":[]}`); got != "" {
+		t.Errorf("missing field should return empty, got %q", got)
+	}
+	if got := extractInferenceGeo(`not json`); got != "" {
+		t.Errorf("malformed JSON should return empty, got %q", got)
 	}
 }
 
@@ -410,21 +482,142 @@ func TestClassifyOffload_NotOffloadable(t *testing.T) {
 
 func TestCostForTokens(t *testing.T) {
 	// 1000 input tokens of opus at $5/MTok = $0.005
-	cost := CostForTokens("claude-opus-4-6", 1000, 0, 0, 0)
+	cost := CostForTokens("claude-opus-4-6", 1000, 0, 0, 0, 0)
 	if fmt.Sprintf("%.6f", cost) != "0.005000" {
 		t.Errorf("got %f, want 0.005", cost)
 	}
 
 	// 1000 output tokens of opus at $25/MTok = $0.025
-	cost = CostForTokens("claude-opus-4-6", 0, 1000, 0, 0)
+	cost = CostForTokens("claude-opus-4-6", 0, 1000, 0, 0, 0)
 	if fmt.Sprintf("%.6f", cost) != "0.025000" {
 		t.Errorf("got %f, want 0.025", cost)
 	}
 
+	// 5-minute vs 1-hour cache writes are priced differently.
+	// 1000 tokens × $6.25/MTok (5m) = $0.00625
+	cost = CostForTokens("claude-opus-4-6", 0, 0, 0, 1000, 0)
+	if fmt.Sprintf("%.6f", cost) != "0.006250" {
+		t.Errorf("got %f, want 0.00625 for 5m cache write", cost)
+	}
+	// 1000 tokens × $10/MTok (1h) = $0.010
+	cost = CostForTokens("claude-opus-4-6", 0, 0, 0, 0, 1000)
+	if fmt.Sprintf("%.6f", cost) != "0.010000" {
+		t.Errorf("got %f, want 0.010 for 1h cache write", cost)
+	}
+
+	// Opus 4.7 must not silently price at $0 — regression guard for the
+	// issue that motivated the pricing config refactor.
+	cost = CostForTokens("claude-opus-4-7", 1000, 0, 0, 0, 0)
+	if cost == 0 {
+		t.Error("Opus 4.7 priced at $0 — pricing table is missing the new model")
+	}
+
 	// Unknown model returns 0
-	cost = CostForTokens("unknown-model", 1000, 1000, 0, 0)
+	cost = CostForTokens("unknown-model", 1000, 1000, 0, 0, 0)
 	if cost != 0 {
 		t.Errorf("got %f, want 0 for unknown model", cost)
+	}
+}
+
+func TestLookupPricing_DateSuffix(t *testing.T) {
+	// Exact date-stamped variant should fall back to the undated entry.
+	p, ok := LookupPricing("claude-opus-4-7-20260301")
+	if !ok {
+		t.Fatal("expected date-suffix fallback to hit claude-opus-4-7")
+	}
+	base, _ := LookupPricing("claude-opus-4-7")
+	if p != base {
+		t.Errorf("date-suffix lookup returned different pricing than base: %+v vs %+v", p, base)
+	}
+}
+
+func TestLoadPricing_Override(t *testing.T) {
+	t.Cleanup(func() { _, _ = LoadPricing("") })
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pricing.json")
+	overrides := `{
+		"claude-future-model": {"input": 7, "output": 35, "cache_read": 0.7, "cache_write_5m": 8.75, "cache_write_1h": 14},
+		"claude-opus-4-7":     {"input": 6, "output": 30, "cache_read": 0.6, "cache_write_5m": 7.5,  "cache_write_1h": 12}
+	}`
+	if err := os.WriteFile(path, []byte(overrides), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source, err := LoadPricing(path)
+	if err != nil {
+		t.Fatalf("LoadPricing failed: %v", err)
+	}
+	if source != path {
+		t.Errorf("source = %q, want %q", source, path)
+	}
+
+	// New model is now resolvable.
+	if p, ok := LookupPricing("claude-future-model"); !ok || p.Input != 7 {
+		t.Errorf("claude-future-model not loaded: %+v ok=%v", p, ok)
+	}
+	// Existing model was overridden.
+	p, ok := LookupPricing("claude-opus-4-7")
+	if !ok || p.Input != 6 {
+		t.Errorf("claude-opus-4-7 override not applied: %+v ok=%v", p, ok)
+	}
+	// Untouched models still fall back to defaults.
+	if p, ok := LookupPricing("claude-haiku-4-5"); !ok || p.Input != 1 {
+		t.Errorf("claude-haiku-4-5 should remain at $1 input: %+v ok=%v", p, ok)
+	}
+}
+
+func TestLoadPricing_Missing(t *testing.T) {
+	t.Cleanup(func() { _, _ = LoadPricing("") })
+
+	// A non-empty path that does not exist is an error.
+	if _, err := LoadPricing(filepath.Join(t.TempDir(), "does-not-exist.json")); err == nil {
+		t.Error("expected error for missing explicit pricing file")
+	}
+
+	// Empty path with no default file present should silently use embedded.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	source, err := LoadPricing("")
+	if err != nil {
+		t.Fatalf("empty path should not error when no default file exists: %v", err)
+	}
+	if source != "embedded" {
+		t.Errorf("source = %q, want embedded", source)
+	}
+}
+
+func TestLoadPricing_Malformed(t *testing.T) {
+	t.Cleanup(func() { _, _ = LoadPricing("") })
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPricing(path); err == nil {
+		t.Error("expected error for malformed pricing JSON")
+	}
+}
+
+func TestDataResidencyMultiplier(t *testing.T) {
+	if got := DataResidencyMultiplier("us-only"); got != 1.1 {
+		t.Errorf("us-only → %f, want 1.1", got)
+	}
+	if got := DataResidencyMultiplier(""); got != 1.0 {
+		t.Errorf("empty → %f, want 1.0", got)
+	}
+	if got := DataResidencyMultiplier("global"); got != 1.0 {
+		t.Errorf("global → %f, want 1.0", got)
+	}
+}
+
+func TestWebSearchCost(t *testing.T) {
+	if got := WebSearchCost(1000); got != 10.0 {
+		t.Errorf("1000 searches → $%f, want $10", got)
+	}
+	if got := WebSearchCost(1); got != 0.01 {
+		t.Errorf("1 search → $%f, want $0.01", got)
+	}
+	if got := WebSearchCost(0); got != 0 {
+		t.Errorf("0 searches → $%f, want $0", got)
 	}
 }
 
@@ -679,6 +872,106 @@ func TestAnalyze_ContextAndMemory(t *testing.T) {
 	// Compacted message has no .claude/ paths
 	if len(report.Messages[2].MemoryFilesLoaded) != 0 {
 		t.Errorf("msg[2] memory files = %d, want 0", len(report.Messages[2].MemoryFilesLoaded))
+	}
+}
+
+func TestAnalyze_PricingDimensions(t *testing.T) {
+	now := time.Now()
+	traces := []logger.Trace{
+		{
+			// Baseline: standard request, no cache, no server tools, no residency.
+			Timestamp:    now,
+			SessionID:    "s1",
+			Model:        "claude-opus-4-7",
+			InputTokens:  1_000_000,
+			OutputTokens: 0,
+			Request:      `{"model":"claude-opus-4-7","messages":[]}`,
+			Response:     `{"content":[],"usage":{"input_tokens":1000000}}`,
+		},
+		{
+			// US-only residency → 1.1x multiplier on token cost.
+			Timestamp:    now.Add(time.Second),
+			SessionID:    "s1",
+			Model:        "claude-opus-4-7",
+			InputTokens:  1_000_000,
+			OutputTokens: 0,
+			InferenceGeo: "us-only",
+			Request:      `{"model":"claude-opus-4-7","inference_geo":"us-only","messages":[]}`,
+			Response:     `{"content":[],"usage":{"input_tokens":1000000}}`,
+		},
+		{
+			// Cache creation with per-TTL split: 1M tokens 5m + 1M tokens 1h.
+			Timestamp:             now.Add(2 * time.Second),
+			SessionID:             "s1",
+			Model:                 "claude-opus-4-7",
+			CacheCreation5mTokens: 1_000_000,
+			CacheCreation1hTokens: 1_000_000,
+			Request:               `{"model":"claude-opus-4-7","messages":[]}`,
+			Response:              `{"content":[],"usage":{"cache_creation_input_tokens":2000000,"cache_creation":{"ephemeral_5m_input_tokens":1000000,"ephemeral_1h_input_tokens":1000000}}}`,
+		},
+		{
+			// Web search surcharge: 1,000 requests → $10.00.
+			Timestamp:         now.Add(3 * time.Second),
+			SessionID:         "s1",
+			Model:             "claude-opus-4-7",
+			WebSearchRequests: 1000,
+			Request:           `{"model":"claude-opus-4-7","messages":[]}`,
+			Response:          `{"content":[],"usage":{"server_tool_use":{"web_search_requests":1000}}}`,
+		},
+	}
+
+	report := Analyze(traces, []string{"test.jsonl"})
+	if len(report.Messages) != 4 {
+		t.Fatalf("got %d messages, want 4", len(report.Messages))
+	}
+
+	// msg[0]: 1M input at $5 = $5.00
+	if diff := report.Messages[0].Cost - 5.00; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("msg[0] cost = $%f, want ~$5.00", report.Messages[0].Cost)
+	}
+	// msg[1]: 1M input at $5 * 1.1 = $5.50
+	if diff := report.Messages[1].Cost - 5.50; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("msg[1] cost (us-only) = $%f, want ~$5.50", report.Messages[1].Cost)
+	}
+	if report.Messages[1].InferenceGeo != "us-only" {
+		t.Errorf("msg[1] InferenceGeo = %q, want us-only", report.Messages[1].InferenceGeo)
+	}
+	// msg[2]: 1M × $6.25 (5m) + 1M × $10.00 (1h) = $16.25
+	if diff := report.Messages[2].Cost - 16.25; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("msg[2] cost (cache split) = $%f, want ~$16.25", report.Messages[2].Cost)
+	}
+	// msg[3]: 1000 web-search requests at $10/1000 = $10.00
+	if diff := report.Messages[3].Cost - 10.00; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("msg[3] cost (web search) = $%f, want ~$10.00", report.Messages[3].Cost)
+	}
+
+	// CostReport summaries.
+	if report.Cost.DataResidencyMessages != 1 {
+		t.Errorf("DataResidencyMessages = %d, want 1", report.Cost.DataResidencyMessages)
+	}
+	if diff := report.Cost.DataResidencyAdjustment - 0.50; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("DataResidencyAdjustment = $%f, want ~$0.50", report.Cost.DataResidencyAdjustment)
+	}
+	if report.Cost.WebSearchRequestsTotal != 1000 {
+		t.Errorf("WebSearchRequestsTotal = %d, want 1000", report.Cost.WebSearchRequestsTotal)
+	}
+	if diff := report.Cost.WebSearchCostTotal - 10.00; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("WebSearchCostTotal = $%f, want ~$10.00", report.Cost.WebSearchCostTotal)
+	}
+
+	// ModelCost aggregates the per-TTL cache breakdown.
+	if len(report.Cost.ByModel) != 1 {
+		t.Fatalf("got %d model rows, want 1", len(report.Cost.ByModel))
+	}
+	mc := report.Cost.ByModel[0]
+	if mc.CacheCreation5mTokens != 1_000_000 || mc.CacheCreation1hTokens != 1_000_000 {
+		t.Errorf("cache tokens = 5m=%d 1h=%d, want 1M/1M", mc.CacheCreation5mTokens, mc.CacheCreation1hTokens)
+	}
+	if diff := mc.CacheCreation5mCost - 6.25; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("5m cache cost = $%f, want $6.25", mc.CacheCreation5mCost)
+	}
+	if diff := mc.CacheCreation1hCost - 10.00; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("1h cache cost = $%f, want $10.00", mc.CacheCreation1hCost)
 	}
 }
 

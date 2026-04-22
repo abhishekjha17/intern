@@ -21,13 +21,23 @@ type MessageProfile struct {
 	SessionID string    `json:"session_id"`
 	Model     string    `json:"model"`
 
-	// Token counts
-	InputTokens         int     `json:"input_tokens"`
-	OutputTokens        int     `json:"output_tokens"`
-	CacheReadTokens     int     `json:"cache_read_tokens"`
-	CacheCreationTokens int     `json:"cache_creation_tokens"`
-	ThinkingTokens      int     `json:"thinking_tokens"`
-	Cost                float64 `json:"cost"`
+	// Token counts. CacheCreationTokens is the sum of the 5m and 1h buckets,
+	// preserved for callers that consumed the pre-split JSON schema.
+	InputTokens           int     `json:"input_tokens"`
+	OutputTokens          int     `json:"output_tokens"`
+	CacheReadTokens       int     `json:"cache_read_tokens"`
+	CacheCreationTokens   int     `json:"cache_creation_tokens"`
+	CacheCreation5mTokens int     `json:"cache_creation_5m_tokens"`
+	CacheCreation1hTokens int     `json:"cache_creation_1h_tokens"`
+	ThinkingTokens        int     `json:"thinking_tokens"`
+	Cost                  float64 `json:"cost"`
+
+	// Server-side tool usage and data-residency metadata affect billing in ways
+	// that are orthogonal to token counts.
+	WebSearchRequests     int     `json:"web_search_requests,omitempty"`
+	CodeExecutionRequests int     `json:"code_execution_requests,omitempty"`
+	InferenceGeo          string  `json:"inference_geo,omitempty"`
+	WebSearchCost         float64 `json:"web_search_cost,omitempty"`
 
 	// Content analysis
 	OutputType      string   `json:"output_type"`
@@ -59,40 +69,58 @@ type ProfileReport struct {
 	Files    []string         `json:"files"`
 	Messages []MessageProfile `json:"messages"`
 
-	Cost       CostReport          `json:"cost"`
-	Tokens     TokenStats          `json:"tokens"`
-	Tools      ToolUsage           `json:"tools"`
+	Cost       CostReport           `json:"cost"`
+	Tokens     TokenStats           `json:"tokens"`
+	Tools      ToolUsage            `json:"tools"`
 	Blocks     ContentBlockAnalysis `json:"content_blocks"`
-	Sessions   []SessionSummary    `json:"sessions"`
-	Thinking   ThinkingAnalysis    `json:"thinking"`
-	Phases     []CategoryCount     `json:"phases"`
-	Complexity []CategoryCount     `json:"complexity"`
-	Offload    OffloadAnalysis     `json:"offload"`
-	Context    ContextAnalysis     `json:"context"`
-	Memory     MemoryAnalysis      `json:"memory"`
+	Sessions   []SessionSummary     `json:"sessions"`
+	Thinking   ThinkingAnalysis     `json:"thinking"`
+	Phases     []CategoryCount      `json:"phases"`
+	Complexity []CategoryCount      `json:"complexity"`
+	Offload    OffloadAnalysis      `json:"offload"`
+	Context    ContextAnalysis      `json:"context"`
+	Memory     MemoryAnalysis       `json:"memory"`
 }
 
 // ModelCost holds cost breakdown for a single model.
+//
+// CacheCreationTokens and CacheCreationCost are sums preserved for callers
+// that depended on the pre-split JSON schema; the 5m/1h fields give the
+// actual per-TTL breakdown. DataResidencyAdjustment captures the additional
+// spend contributed by the 1.1x multiplier when inference_geo=="us-only".
 type ModelCost struct {
-	Model               string  `json:"model"`
-	Messages            int     `json:"messages"`
-	InputTokens         int     `json:"input_tokens"`
-	OutputTokens        int     `json:"output_tokens"`
-	CacheReadTokens     int     `json:"cache_read_tokens"`
-	CacheCreationTokens int     `json:"cache_creation_tokens"`
-	InputCost           float64 `json:"input_cost"`
-	OutputCost          float64 `json:"output_cost"`
-	CacheReadCost       float64 `json:"cache_read_cost"`
-	CacheCreationCost   float64 `json:"cache_creation_cost"`
-	TotalCost           float64 `json:"total_cost"`
-	AvgCostPerMessage   float64 `json:"avg_cost_per_message"`
+	Model                   string  `json:"model"`
+	Messages                int     `json:"messages"`
+	InputTokens             int     `json:"input_tokens"`
+	OutputTokens            int     `json:"output_tokens"`
+	CacheReadTokens         int     `json:"cache_read_tokens"`
+	CacheCreationTokens     int     `json:"cache_creation_tokens"`
+	CacheCreation5mTokens   int     `json:"cache_creation_5m_tokens"`
+	CacheCreation1hTokens   int     `json:"cache_creation_1h_tokens"`
+	InputCost               float64 `json:"input_cost"`
+	OutputCost              float64 `json:"output_cost"`
+	CacheReadCost           float64 `json:"cache_read_cost"`
+	CacheCreationCost       float64 `json:"cache_creation_cost"`
+	CacheCreation5mCost     float64 `json:"cache_creation_5m_cost"`
+	CacheCreation1hCost     float64 `json:"cache_creation_1h_cost"`
+	WebSearchRequests       int     `json:"web_search_requests,omitempty"`
+	CodeExecutionRequests   int     `json:"code_execution_requests,omitempty"`
+	WebSearchCost           float64 `json:"web_search_cost,omitempty"`
+	DataResidencyAdjustment float64 `json:"data_residency_adjustment,omitempty"`
+	TotalCost               float64 `json:"total_cost"`
+	AvgCostPerMessage       float64 `json:"avg_cost_per_message"`
 }
 
 // CostReport aggregates costs across all models.
 type CostReport struct {
-	ByModel    []ModelCost `json:"by_model"`
-	GrandTotal float64     `json:"grand_total"`
-	AvgPerMsg  float64     `json:"avg_per_message"`
+	ByModel                    []ModelCost `json:"by_model"`
+	GrandTotal                 float64     `json:"grand_total"`
+	AvgPerMsg                  float64     `json:"avg_per_message"`
+	WebSearchRequestsTotal     int         `json:"web_search_requests_total,omitempty"`
+	CodeExecutionRequestsTotal int         `json:"code_execution_requests_total,omitempty"`
+	WebSearchCostTotal         float64     `json:"web_search_cost_total,omitempty"`
+	DataResidencyMessages      int         `json:"data_residency_messages,omitempty"`
+	DataResidencyAdjustment    float64     `json:"data_residency_adjustment,omitempty"`
 }
 
 // ModelTokenStats holds average token counts for a single model.
