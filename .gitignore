@@ -41,6 +41,9 @@ go.work.sum
 # env file
 .env
 
+# secrets
+.secrets
+
 # Editor/IDE
 # .idea/
 # .vscode/
