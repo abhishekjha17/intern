@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/abhishekjha17/intern/compare/v0.1.2...v0.1.3) (2026-04-24)
+
+
+### Bug Fixes
+
+* **ci:** trigger release workflow on release-please tags ([71a2ffb](https://github.com/abhishekjha17/intern/commit/71a2ffb585e08a6120c691e353d4c2921c3ebb66))
+* **ci:** trigger release workflow on release-please tags ([51a8452](https://github.com/abhishekjha17/intern/commit/51a84526ebdbd0ad637842f092cbf6fafe15e01c))
+
 ## [0.1.2](https://github.com/abhishekjha17/intern/compare/v0.1.1...v0.1.2) (2026-04-22)
 
 
