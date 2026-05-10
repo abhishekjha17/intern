@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/abhishekjha17/intern/internal/logger"
+	"github.com/abhishekjha17/intern/internal/orchestrator"
+	"github.com/abhishekjha17/intern/internal/orchestrator/local"
 	"github.com/abhishekjha17/intern/internal/profiler"
 )
 
@@ -48,6 +50,8 @@ func main() {
 			os.Exit(runProfile(os.Args[2:]))
 		case "proxy":
 			os.Exit(runProxy(os.Args[2:]))
+		case "plan":
+			os.Exit(runPlan(os.Args[2:]))
 		case "help", "--help", "-h":
 			printUsage()
 			return
@@ -66,6 +70,7 @@ Usage:
   intern proxy [flags]        Start the proxy server
   intern profile [flags] <trace-files...>
                               Analyze trace files
+  intern plan [flags]         Render the orchestrator planner system prompt to stdout
   intern --version            Print version information
 
 Run 'intern <command> --help' for details on a specific command.
@@ -91,6 +96,8 @@ func runProxy(args []string) int {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	port := fs.Int("port", 11411, "port to listen on")
 	traceFile := fs.String("trace", defaultTraceDir(), "path to the JSONL trace file")
+	orchestrate := fs.String("orchestrate", "off", "orchestration mode: 'off' (default), 'shadow' (observe + log), or 'full' (intercept first-of-session, plan via Opus, execute locally)")
+	shadowLog := fs.String("shadow-log", "", "path to shadow log file (default: ~/.intern/shadow.jsonl)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: intern proxy [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
@@ -105,8 +112,50 @@ func runProxy(args []string) int {
 	lt := logger.New(*traceFile, chanBufSize)
 	defer lt.Close()
 
+	var hookCloser interface{ Close() error }
+	var transport http.RoundTripper = lt
+
+	switch *orchestrate {
+	case "", "off":
+		// no-op
+	case "shadow":
+		o, err := orchestrator.New()
+		if err != nil {
+			log.Fatalf("orchestrator: %v", err)
+		}
+		hook, err := orchestrator.NewShadowHook(o, *shadowLog)
+		if err != nil {
+			log.Fatalf("orchestrator shadow: %v", err)
+		}
+		lt.SetObserver(hook)
+		hookCloser = hook
+		log.Printf("orchestrator: shadow mode active (manifest=%s, models=%d, planner=%d bytes)",
+			o.Manifest.Hash, len(o.Manifest.Models), len(o.PlannerBlock()))
+	case "full":
+		o, err := orchestrator.New()
+		if err != nil {
+			log.Fatalf("orchestrator: %v", err)
+		}
+		// No AgentBackend is wired in full mode yet; advertising
+		// agent profiles to the planner causes it to emit `agent`
+		// steps that error and force every plan to escalate.
+		if err := o.DisableAgents(); err != nil {
+			log.Fatalf("orchestrator: %v", err)
+		}
+		backend := local.NewVLLMMLX(o.Manifest)
+		transport = orchestrator.NewFullModeTransport(o, lt, backend)
+		log.Printf("orchestrator: FULL mode active (manifest=%s, models=%d, planner=%d bytes, agents=disabled)",
+			o.Manifest.Hash, len(o.Manifest.Models), len(o.PlannerBlock()))
+		log.Printf("orchestrator: first-of-session non-streaming requests will be planned and executed locally; failures fall back to passthrough")
+	default:
+		log.Fatalf("invalid --orchestrate value %q (want 'off', 'shadow', or 'full')", *orchestrate)
+	}
+	if hookCloser != nil {
+		defer hookCloser.Close()
+	}
+
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
-	proxy.Transport = lt
+	proxy.Transport = transport
 
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = upstream.Scheme
@@ -135,6 +184,30 @@ func runProxy(args []string) int {
 	log.Printf("intern proxy listening on %s → %s (traces → %s)", addr, upstreamURL, *traceFile)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("listen: %v", err)
+	}
+	return 0
+}
+
+// runPlan renders the planner system prompt against ~/.intern config and
+// prints it to stdout. Useful for verifying what the orchestrator would
+// send before flipping --orchestrate=shadow.
+func runPlan(args []string) int {
+	fs := flag.NewFlagSet("plan", flag.ExitOnError)
+	jsonOutput := fs.Bool("json", false, "also emit the emit_plan tool definition as JSON to stderr")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: intern plan [flags]\n\nRenders the orchestrator planner system prompt to stdout.\nReads ~/.intern/local_models.yaml and ~/.intern/permissions.yaml when present.\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+
+	o, err := orchestrator.New()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	fmt.Print(o.PlannerBlock())
+	if *jsonOutput {
+		fmt.Fprintf(os.Stderr, "\n--- emit_plan tool ---\n%s\n", string(o.EmitPlanTool()))
 	}
 	return 0
 }

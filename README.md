@@ -78,13 +78,17 @@ Starts a transparent reverse proxy to the Anthropic API with trace logging.
 intern proxy [flags]
 
 Flags:
-  --port   int     Port to listen on (default: 11411)
-  --trace  string  Path to JSONL trace file (default: ~/.intern/traces/traces.jsonl)
+  --port         int     Port to listen on (default: 11411)
+  --trace        string  Path to JSONL trace file (default: ~/.intern/traces/traces.jsonl)
+  --orchestrate  string  Orchestration mode: 'off' (default) or 'shadow'
+  --shadow-log   string  Shadow log path (default: ~/.intern/shadow.jsonl)
 ```
 
 Configure your client to use `http://localhost:11411` as the API base URL. The proxy forwards all requests to `api.anthropic.com` and logs both sides of each interaction.
 
 When installed via Homebrew and run as a service (`brew services start intern`), traces are written to `$(brew --prefix)/var/log/intern/traces.jsonl` instead.
+
+`--orchestrate=shadow` is a no-cost preview of the upcoming offload layer: every first-of-session request additionally appends one JSONL line to `--shadow-log` capturing the manifest hash, planner block size, sha256, and `emit_plan` tool definition the orchestrator *would* send in full mode. No upstream calls are added; client behavior is unchanged. See [`docs/orchestrator/README.md`](docs/orchestrator/README.md).
 
 ### `intern profile`
 
@@ -120,6 +124,19 @@ intern profile traces_day1.jsonl traces_day2.jsonl
 # Pipe JSON to other tools
 intern profile --json session.jsonl | jq '.cost.grand_total'
 ```
+
+### `intern plan`
+
+Renders the orchestrator planner system prompt to stdout. Useful for verifying what shadow mode would send, or for pasting into a Claude Console session for manual experimentation.
+
+```
+intern plan [flags]
+
+Flags:
+  --json   Also emit the emit_plan tool definition as JSON to stderr
+```
+
+Reads `~/.intern/local_models.yaml` and `~/.intern/permissions.yaml` when present; produces sensible defaults otherwise.
 
 ### Version
 
@@ -180,8 +197,10 @@ Session IDs are derived from the first message in a conversation, so all turns i
 
 ## Roadmap
 
-- [ ] **Multi-model routing** — Classify requests by complexity and route simple ones to local models (Ollama) while passing complex ones to the cloud API
-- [ ] **Configurable routing rules** — User-defined rules for routing based on tools, token count, or conversation phase
+- [x] **Orchestrator (shadow mode)** — `--orchestrate=shadow` observes first-of-session requests and logs what would be planned. See [`docs/orchestrator/`](docs/orchestrator/).
+- [ ] **Orchestrator (full mode)** — Rewrite outgoing requests to inject the planner block, force the `emit_plan` tool, parse the returned `plan@v1` program, execute its DAG against internal tools / local models / fabricated client tool calls, fold the terminal step's message into the response.
+- [ ] **Local model backends** — Ollama / HTTP backends behind the `LocalBackend` interface so `local` plan steps actually invoke models.
+- [ ] **Configurable routing rules** — User-defined rules for which sessions trigger orchestration
 - [ ] **Web dashboard** — Browser-based visualization of session traces and cost trends
 - [ ] **Real-time profiling** — Live cost and usage stats while the proxy is running
 - [ ] **Budget alerts** — Configurable spending thresholds with notifications

@@ -234,14 +234,25 @@ func sessionID(messages []json.RawMessage) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
+// RequestObserver is the hook the orchestrator (or any other module)
+// implements to observe requests as they flow through the proxy. The
+// roundtripper calls OnRequest *after* it has snapshotted and parsed the
+// request body, and *before* it forwards the request upstream. The
+// observer must not block — its work belongs in a goroutine if it does
+// any I/O.
+type RequestObserver interface {
+	OnRequest(sessionID string, model string, reqBody []byte)
+}
+
 // LoggingRoundTripper implements http.RoundTripper. It transparently forwards
 // every request to the Anthropic API while capturing the request/response bodies
 // and shipping them to a background worker for async JSONL logging.
 type LoggingRoundTripper struct {
-	inner   http.RoundTripper
-	ch      chan logEntry
-	done    chan struct{}
-	logFile string
+	inner    http.RoundTripper
+	ch       chan logEntry
+	done     chan struct{}
+	logFile  string
+	observer RequestObserver
 }
 
 // New creates a LoggingRoundTripper and starts its background worker.
@@ -264,6 +275,11 @@ func New(logFile string, bufSize int) *LoggingRoundTripper {
 	go l.worker()
 	return l
 }
+
+// SetObserver attaches a RequestObserver. Pass nil to detach. Safe to
+// call before traffic starts flowing; not safe to call concurrently
+// with in-flight requests.
+func (l *LoggingRoundTripper) SetObserver(o RequestObserver) { l.observer = o }
 
 // teeReadCloser wraps a response body so that every byte the caller reads is
 // also captured in a buffer. When Close is called the complete response is
@@ -322,11 +338,6 @@ func (l *LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 
 	ts := time.Now()
 
-	resp, err := l.inner.RoundTrip(req)
-	if err != nil {
-		return resp, err
-	}
-
 	// Extract model, session ID, and inference_geo from the request JSON (best-effort).
 	var model, sid, geo string
 	var ar anthropicRequest
@@ -334,6 +345,15 @@ func (l *LoggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 		model = ar.Model
 		sid = sessionID(ar.Messages)
 		geo = ar.InferenceGeo
+	}
+
+	if l.observer != nil {
+		l.observer.OnRequest(sid, model, reqBody)
+	}
+
+	resp, err := l.inner.RoundTrip(req)
+	if err != nil {
+		return resp, err
 	}
 
 	// Wrap the response body so we capture it as the caller streams through it.
